@@ -67,6 +67,19 @@ class BaseUrlTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             custom_base_url('http://localhost:8000/v1', allow_local_http=False)
 
+    def test_a_prefixed_v1_path_is_accepted(self):
+        self.assertEqual(custom_base_url('https://opencode.ai/zen/v1'), 'https://opencode.ai/zen/v1')
+        self.assertEqual(custom_base_url('https://proxy.example.test/api/v1/'), 'https://proxy.example.test/api/v1')
+        self.assertEqual(custom_base_url('http://127.0.0.1:4000/openai/v1'),
+                         'http://127.0.0.1:4000/openai/v1')
+
+    def test_a_dot_segment_in_the_path_is_refused(self):
+        for bad in ('https://api.example.test/v1/../v1', 'https://api.example.test/./v1',
+                    'https://api.example.test/a//v1', 'https://api.example.test/v1%2f..'):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    custom_base_url(bad)
+
     def test_plain_http_hosts_and_smuggling_are_refused(self):
         for bad in ('http://api.example.test/v1', 'https://user:pw@api.example.test/v1',
                     'https://api.example.test/v1?key=x', 'https://api.example.test/v1#frag',

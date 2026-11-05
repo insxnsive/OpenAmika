@@ -1347,6 +1347,9 @@ _CUSTOM_API_MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,79}")
 _CUSTOM_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
+_CUSTOM_PATH_SEGMENT = re.compile(r"^[A-Za-z0-9._~-]+$")
+
+
 def custom_base_url(url, *, allow_local_http=True):
     """The OpenAI-compatible base URL the person typed, normalised, ending in /v1.
 
@@ -1374,10 +1377,18 @@ def custom_base_url(url, *, allow_local_http=True):
             raise ValueError("http is accepted for localhost only; use https")
     elif parts.scheme != "https":
         raise ValueError("The base URL must be https, or http on localhost")
-    if parts.path.rstrip("/") != "/v1":
+    # Any path that ends in /v1, because plenty of real servers live under a prefix
+    # (https://opencode.ai/zen/v1, a LiteLLM proxy at /api/v1). Dot segments are refused so the
+    # stored base cannot be made to read as something other than what the person typed.
+    if "//" in parts.path.strip("/"):
+        raise ValueError("The base URL path has an empty segment")
+    segments = [piece for piece in parts.path.split("/") if piece]
+    if not segments or segments[-1] != "v1":
         raise ValueError("Use the OpenAI-compatible base ending in /v1")
+    if any(piece in (".", "..") or not _CUSTOM_PATH_SEGMENT.match(piece) for piece in segments):
+        raise ValueError("The base URL path has characters this field cannot carry")
     netloc = host if port is None else host + ":" + str(port)
-    return parts.scheme + "://" + netloc + "/v1"
+    return parts.scheme + "://" + netloc + "/" + "/".join(segments)
 
 
 def _custom_prices(raw, label):
