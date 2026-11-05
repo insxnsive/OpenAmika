@@ -477,6 +477,12 @@ class CustomReloadTests(unittest.TestCase):
         self.assertEqual(summary['total_requests'], 1)
         self.assertAlmostEqual(summary['priced_known_usd'], 0.0012)
         self.assertEqual(summary['active_requests'], 0)
+        # Not just the amount: the charge must come from the price table, which is the branch a
+        # provider-reported cost would bypass.
+        with self.meter.read_connection() as conn:
+            row = conn.execute("SELECT cost_source, pricing_status FROM requests").fetchone()
+        self.assertEqual(row['cost_source'], 'price_table')
+        self.assertEqual(row['pricing_status'], 'priced')
 
     def test_a_reported_cost_in_the_usage_frame_cannot_decide_the_charge(self):
         self._stream_once({'prompt_tokens': 1000, 'completion_tokens': 100,
