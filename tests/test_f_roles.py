@@ -495,6 +495,116 @@ class CustomReloadTests(unittest.TestCase):
         # The reservation is still held against the budget: only the settled amount is returned.
         self.assertLess(summary['budget']['remaining_usd'], 1.0)
 
+    def test_a_failed_repair_keeps_the_recovery_note(self):
+        marker = self.root / 'config/recovery.json'
+        marker.write_text('{"reason": "split files from an earlier save"}', encoding='utf-8')
+        self.g['_custom_unavailable'] = 'split files from an earlier save'
+        self._seed_env()
+        commit, args = self._commit_args(key='repair-key')
+        calls = {'roles': 0}
+
+        def write(path, content):
+            if path.name == 'llm_roles.json':
+                calls['roles'] += 1
+                if calls['roles'] == 1:      # the repair fails, its restore of the old files succeeds
+                    raise PermissionError('locked')
+            path.write_text(content, encoding='utf-8')
+
+        with mock.patch.dict(os.environ, {'CUSTOM_OPENAI_API_KEY': 'old-key'}):
+            with self.assertRaises(ValueError):
+                commit(**args, write=write)
+        self.assertTrue(marker.is_file())                       # restoring untrusted files is not recovery
+        self.assertEqual(self.g.get('_custom_unavailable'), 'split files from an earlier save')
+        self.assertEqual(json.loads(marker.read_text(encoding='utf-8'))['reason'],
+                         'split files from an earlier save')
+
+    def test_a_recovery_note_blocks_a_fresh_start(self):
+        from f_roles import install_roles
+        root = Path(self.tmp.name) / 'second'
+        (root / 'config').mkdir(parents=True)
+        shutil.copyfile(ROOT / 'config/openrouter_models.json', root / 'config/openrouter_models.json')
+        document = {'version': 1, 'options': {}, 'selections': {}}
+        for role in ROLES:
+            document['options'][role] = [
+                {'key': 'native:' + NATIVE_KEYS[role], 'native_key': NATIVE_KEYS[role], 'name': 'Native'},
+                {'key': 'or:' + role, 'model_id': 'deepseek/deepseek-v4-flash-0731', 'name': 'Reviewed ' + role}]
+            document['selections'][role] = 'or:' + role
+        (root / 'config/llm_roles.json').write_text(json.dumps(document), encoding='utf-8')
+        (root / 'config/custom_models.recovery.json').write_text('{"reason": "split files"}', encoding='utf-8')
+        # A new process only knows the native models; role options are registered by its own manager.
+        fresh = {'AVAILABLE_MODELS': {k: dict(v) for k, v in self.g['AVAILABLE_MODELS'].items()
+                                      if k in NATIVE_KEYS.values()},
+                 '_pick_stream': lambda p, c, **kw: iter(['native']), 'http_requests': None}
+        install_roles(fresh, root, self.memory, self.meter, lambda *a, **k: contextlib.nullcontext(),
+                      self.local, {})
+        self.assertEqual(fresh.get('_custom_unavailable'), 'split files')
+
+    def test_a_catalog_write_failure_keeps_the_recovery_note(self):
+        marker = self.root / 'config/recovery.json'
+        marker.write_text('{"reason": "split files from an earlier save"}', encoding='utf-8')
+        self.g['_custom_unavailable'] = 'split files from an earlier save'
+        commit, args = self._commit_args(key='repair-key')
+
+        def write(path, content):
+            if path.name == 'custom_models.json':
+                raise PermissionError('locked')
+            path.write_text(content, encoding='utf-8')
+
+        with self.assertRaises(ValueError):
+            commit(**args, write=write)
+        self.assertTrue(marker.is_file())
+        self.assertEqual(self.g.get('_custom_unavailable'), 'split files from an earlier save')
+
+    def test_work_cannot_enter_while_a_failed_save_is_rolling_back(self):
+        self._publish('custom/first')
+        base = self.manager.custom['base']
+        self._seed_env()
+        commit, args = self._commit_args(key='')
+        entered, release = threading.Event(), threading.Event()
+        calls = {'roles': 0}
+        outcome = {}
+
+        def write(path, content):
+            if path.name == 'llm_roles.json':
+                calls['roles'] += 1
+                if calls['roles'] == 1:
+                    raise PermissionError('locked')       # the save fails here
+                entered.set()                              # ...and the rollback pauses here
+                release.wait(10)
+            path.write_text(content, encoding='utf-8')
+
+        def save():
+            try:
+                commit(**args, write=write)
+            except Exception as error:  # noqa: BLE001 - the failure is the point
+                outcome['save'] = error
+
+        saver = threading.Thread(target=save)
+        saver.start()
+        self.assertTrue(entered.wait(10))
+        reader_done, select_done = threading.Event(), threading.Event()
+
+        def read():
+            with mock.patch.dict(os.environ, {'CUSTOM_OPENAI_API_KEY': 'key-a'}):
+                outcome['runtime'] = self.manager.custom_runtime()
+            reader_done.set()
+
+        def choose():
+            try:
+                self.manager.set(dict(self.manager.selections))
+            except Exception:  # noqa: BLE001 - a refusal is also "did not enter"
+                pass
+            select_done.set()
+
+        threading.Thread(target=read).start()
+        threading.Thread(target=choose).start()
+        self.assertFalse(reader_done.wait(0.3), 'a reader entered during rollback')
+        self.assertFalse(select_done.wait(0.3), 'a selection entered during rollback')
+        release.set()
+        saver.join(10)
+        self.assertTrue(reader_done.wait(5) and select_done.wait(5))
+        self.assertEqual(outcome['runtime'], {'base': base, 'key': 'key-a'})
+
     def test_a_save_refuses_while_memory_work_holds_its_lock(self):
         self._publish('custom/first')
         with self.manager.memory._worker_lock:

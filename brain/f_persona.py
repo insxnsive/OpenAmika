@@ -191,6 +191,22 @@ def _commit_custom_config(catalog, payload, key, manager, g, catalog_path, roles
         except OSError:
             return False
 
+    # What the installation looked like before this attempt. A repair that fails must leave that state
+    # intact: the files it started from were already untrusted, so a successful restore of them is not
+    # a recovery, and dropping the note would let the next start use them again.
+    entry_reason = g.get("_custom_unavailable")
+    entry_marker = marker_path.is_file() if not entry_reason else True
+
+    def _keep_entry_state(fallback_reason=None):
+        reason = entry_reason or fallback_reason
+        if reason:
+            g["_custom_unavailable"] = reason
+        if entry_marker and reason:
+            try:
+                _mark(reason)
+            except OSError:
+                pass
+
     guard = manager.custom_write_guard() if manager is not None else contextlib.nullcontext()
     # Rollback and blocked-state publication stay inside the guard: releasing it first would let a
     # reader build a client from files mid-restore.
@@ -209,8 +225,11 @@ def _commit_custom_config(catalog, payload, key, manager, g, catalog_path, roles
             _commit()
         except Exception as error:
             if not state["wrote"]:
-                if not _clear_marker():
+                _keep_entry_state()
+                if not entry_marker and not _clear_marker():
                     g["_custom_unavailable"] = "a recovery note could not be removed"
+                if isinstance(error, OSError):
+                    raise ValueError("Could not write the configuration: " + str(error)) from error
                 raise
             failures = _restore()
             if failures:
@@ -220,11 +239,15 @@ def _commit_custom_config(catalog, payload, key, manager, g, catalog_path, roles
                     _mark(reason)      # replace the intent note with what actually went wrong
                 except OSError:
                     pass               # the intent note written above already blocks the next start
+                entry_reason = entry_reason or reason
                 raise ValueError(
                     "The save failed and part of it could not be undone (" + reason +
                     "). Fix the write problem, then save the whole configuration again; she keeps the "
                     "custom endpoint off until that save succeeds.") from error
-            if not _clear_marker():
+            if entry_marker:
+                # Restoring the pre-repair files is not a recovery: they were already in doubt.
+                _keep_entry_state()
+            elif not _clear_marker():
                 g["_custom_unavailable"] = "a recovery note could not be removed"
                 raise ValueError("The configuration was restored, but the recovery note could not be "
                                  "removed, so she stays off the custom endpoint until it can.")
