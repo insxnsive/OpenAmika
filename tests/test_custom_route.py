@@ -4,6 +4,7 @@ The commit helper has its own tests in test_f_roles.py. This file is the thin HT
 it, which is where the action-header refusal, the status mapping and the speech allowlist live.
 """
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -40,6 +41,9 @@ class CustomRouteTests(unittest.TestCase):
         patcher = mock.patch.object(f_persona, 'BRAIN_DIR', self.root / 'brain')
         patcher.start()
         self.addCleanup(patcher.stop)
+        env = mock.patch.dict(os.environ, {}, clear=False)   # a save sets the key; put it back after
+        env.start()
+        self.addCleanup(env.stop)
         self.g = {'app': Flask(__name__), 'request': request, 'jsonify': jsonify}
         f_persona.install_persona(self.g)
         self.client = self.g['app'].test_client()
@@ -79,6 +83,16 @@ class CustomRouteTests(unittest.TestCase):
             response = self.post()
         self.assertEqual(response.status_code, 400)
         self.assertIn('/v1', response.get_json()['error'])
+        self.assertFalse((self.root / 'config/custom_models.json').exists())
+
+    def test_a_blocked_endpoint_refuses_a_save_without_a_key(self):
+        self.g['_custom_unavailable'] = 'llm_roles.json: access denied'
+        with mock.patch('f_openrouter.load_custom_catalog', return_value=CATALOG), \
+             mock.patch('f_openrouter.fetch_custom_models', return_value=['custom/first']):
+            response = self.post(body={'base_url': 'https://api.example.test/v1', 'key': '',
+                                       'models': BODY['models']})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('Enter the key', response.get_json()['error'])
         self.assertFalse((self.root / 'config/custom_models.json').exists())
 
     def test_the_page_reads_the_blocked_state(self):

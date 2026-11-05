@@ -122,7 +122,7 @@ def _write_atomic(path: Path, content: str):
 
 
 def _commit_custom_config(catalog, payload, key, manager, g, catalog_path, roles_path, env_path, marker_path,
-                          write=None):
+                          write=None, remove=None):
     """Write the catalog, the role rows and the key as one unit, or put every one of them back.
 
     Held inside the manager's own exclusion and testable on its own: the production route and the
@@ -132,6 +132,7 @@ def _commit_custom_config(catalog, payload, key, manager, g, catalog_path, roles
     from f_roles import sync_custom_rows
 
     write = write or _write_atomic
+    remove = remove or (lambda path: path.unlink(missing_ok=True))
     previous_env_value = os.environ.get("CUSTOM_OPENAI_API_KEY")
     state = {"wrote": False, "key_written": False, "catalog": None, "roles": None, "env": None}
 
@@ -179,35 +180,63 @@ def _commit_custom_config(catalog, payload, key, manager, g, catalog_path, roles
                 failures.append(target.name + ": " + str(restore_error))
         return failures
 
+    def _mark(reason):
+        write(marker_path, json.dumps({"reason": reason}, ensure_ascii=False, indent=2) + "\n")
+
+    def _clear_marker():
+        """Remove the recovery note. False when it cannot go, so nobody claims a recovery they did not get."""
+        try:
+            remove(marker_path)
+            return True
+        except OSError:
+            return False
+
     guard = manager.custom_write_guard() if manager is not None else contextlib.nullcontext()
     # Rollback and blocked-state publication stay inside the guard: releasing it first would let a
     # reader build a client from files mid-restore.
     with guard:
+        if g.get("_custom_unavailable") and not key:
+            raise ValueError("Enter the key for this endpoint. A save that repairs the custom "
+                             "endpoint cannot reuse the key that is already stored.")
+        # The intent is recorded on disk BEFORE anything moves. If it cannot be written, the save is
+        # refused: a crash mid-write would otherwise leave split files with nothing to notice them.
+        try:
+            _mark("a save was in progress and did not report back")
+        except OSError as error:
+            raise ValueError("Could not record the save safely (" + str(error) +
+                             "), so nothing was changed.") from error
         try:
             _commit()
         except Exception as error:
             if not state["wrote"]:
+                if not _clear_marker():
+                    g["_custom_unavailable"] = "a recovery note could not be removed"
                 raise
             failures = _restore()
             if failures:
                 reason = "; ".join(failures)
                 g["_custom_unavailable"] = reason
                 try:
-                    write(marker_path, json.dumps({"reason": reason}, ensure_ascii=False, indent=2) + "\n")
+                    _mark(reason)      # replace the intent note with what actually went wrong
                 except OSError:
-                    pass          # the in-memory flag already blocks this run
+                    pass               # the intent note written above already blocks the next start
                 raise ValueError(
                     "The save failed and part of it could not be undone (" + reason +
                     "). Fix the write problem, then save the whole configuration again; she keeps the "
                     "custom endpoint off until that save succeeds.") from error
+            if not _clear_marker():
+                g["_custom_unavailable"] = "a recovery note could not be removed"
+                raise ValueError("The configuration was restored, but the recovery note could not be "
+                                 "removed, so she stays off the custom endpoint until it can.")
             if isinstance(error, OSError):
                 raise ValueError("Could not write the configuration: " + str(error)) from error
             raise
-        g.pop("_custom_unavailable", None)     # a clean save is the recovery
-        try:
-            marker_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        # A coherent commit is what earns the removal; a note that will not go is not a recovery.
+        if not _clear_marker():
+            g["_custom_unavailable"] = "a recovery note could not be removed"
+            raise ValueError("Saved, but the recovery note could not be removed, so she stays off the "
+                             "custom endpoint until the file next to config/custom_models.json is gone.")
+        g.pop("_custom_unavailable", None)
 
 
 def install_persona(g):
@@ -596,6 +625,11 @@ def install_persona(g):
                 # os.environ refuses these, and a refusal after the files were written would leave the
                 # endpoint published with the previous key.
                 raise ValueError("The key contains a character that cannot be saved.")
+            if g.get("_custom_unavailable") and not key:
+                # A repair has to say which key belongs to the endpoint it repairs: the one already
+                # stored may be the key of the endpoint that failed.
+                raise ValueError("Enter the key for this endpoint. A save that repairs the custom "
+                                 "endpoint cannot reuse the key that is already stored.")
             warning = ""
             verified = False
             probe_key = key or (os.environ.get("CUSTOM_OPENAI_API_KEY") or "")

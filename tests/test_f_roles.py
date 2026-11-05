@@ -355,15 +355,79 @@ class CustomReloadTests(unittest.TestCase):
         self.assertTrue((self.root / 'config/recovery.json').is_file())
         self.assertIsNotNone(self.g.get('_custom_unavailable'))
 
-    def test_a_clean_save_clears_the_recovery_marker(self):
+    def test_a_repair_save_needs_the_key_for_the_endpoint_it_repairs(self):
         marker = self.root / 'config/recovery.json'
         marker.write_text('{"reason": "an earlier save"}', encoding='utf-8')
         self.g['_custom_unavailable'] = 'an earlier save'
         commit, args = self._commit_args(key='')
-        commit(**args)
+        with self.assertRaises(ValueError) as raised:
+            commit(**args)
+        self.assertIn('Enter the key', str(raised.exception))
+        self.assertTrue(marker.is_file())                       # the gate stays
+        self.assertFalse((self.root / 'config/custom_models.json').exists())
+
+    def test_a_clean_save_with_a_key_clears_the_recovery_marker(self):
+        marker = self.root / 'config/recovery.json'
+        marker.write_text('{"reason": "an earlier save"}', encoding='utf-8')
+        self.g['_custom_unavailable'] = 'an earlier save'
+        self._seed_env()
+        commit, args = self._commit_args(key='repair-key')
+        with mock.patch.dict(os.environ, {'CUSTOM_OPENAI_API_KEY': 'old-key'}):
+            commit(**args)
+            self.assertEqual(os.environ['CUSTOM_OPENAI_API_KEY'], 'repair-key')
         self.assertFalse(marker.exists())
         self.assertNotIn('_custom_unavailable', self.g)
         self.assertIn('custom/first', self.manager.custom['models'])
+
+    def test_a_save_is_refused_when_the_recovery_note_cannot_be_written(self):
+        commit, args = self._commit_args(key='a-key')
+
+        def write(path, content):
+            if path.name == 'recovery.json':
+                raise PermissionError('no room for the note')
+            path.write_text(content, encoding='utf-8')
+
+        with self.assertRaises(ValueError) as raised:
+            commit(**args, write=write)
+        self.assertIn('Could not record the save safely', str(raised.exception))
+        self.assertFalse((self.root / 'config/custom_models.json').exists())
+
+    def test_a_note_that_cannot_be_removed_does_not_count_as_recovery(self):
+        marker = self.root / 'config/recovery.json'
+        self.g['_custom_unavailable'] = 'an earlier save'
+        self._seed_env()
+        commit, args = self._commit_args(key='repair-key')
+
+        def remove(path):
+            raise PermissionError('locked')
+
+        with mock.patch.dict(os.environ, {'CUSTOM_OPENAI_API_KEY': 'old-key'}):
+            with self.assertRaises(ValueError) as raised:
+                commit(**args, remove=remove)
+        self.assertIn('recovery note could not be removed', str(raised.exception))
+        self.assertEqual(self.g.get('_custom_unavailable'), 'a recovery note could not be removed')
+        self.assertTrue((self.root / 'config/custom_models.json').is_file())   # the save itself landed
+
+    def test_a_failed_reload_restores_disk_key_and_the_pair_readers_see(self):
+        self._publish('custom/first')
+        base_before = self.manager.custom['base']
+        self._seed_env()
+        commit, args = self._commit_args(key='new-key')
+        # Aim the failing save at a different endpoint, so a half-applied commit would be visible.
+        args['catalog']['base'] = 'https://b.example.test/v1'
+        args['payload']['endpoint']['base_url'] = 'https://b.example.test/v1'
+        seen = {}
+
+        with mock.patch.dict(os.environ, {'CUSTOM_OPENAI_API_KEY': 'old-key'}):
+            with mock.patch.object(self.manager, 'reload_custom', side_effect=ValueError('catalog refused')):
+                with self.assertRaises(ValueError):
+                    commit(**args)
+            self.assertEqual(os.environ['CUSTOM_OPENAI_API_KEY'], 'old-key')
+            self.assertFalse((self.root / 'config/recovery.json').exists())
+            saved = json.loads((self.root / 'config/custom_models.json').read_text(encoding='utf-8'))
+            self.assertEqual(saved['endpoint']['base_url'], base_before)
+            seen['runtime'] = self.manager.custom_runtime()  # the guard is released; the old pair is live
+            self.assertEqual(seen['runtime'], {'base': base_before, 'key': 'old-key'})
 
     def test_a_save_refuses_while_memory_work_holds_its_lock(self):
         self._publish('custom/first')
