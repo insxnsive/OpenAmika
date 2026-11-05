@@ -1324,3 +1324,309 @@ def fetch_alibaba_models(http, key, base_url, *, timeout=(5, 20)):
     if not isinstance(rows, list):
         raise OpenRouterError("malformed_payload")
     return sorted({row["id"] for row in rows if isinstance(row, dict) and isinstance(row.get("id"), str)})
+
+
+# Generic OpenAI-compatible endpoint (opt-in, owner decision 2026-11-05).
+#
+# Same receipts, metering hooks and drain as OpenRouter, with no reviewed host list:
+# the person names the endpoint and enters the prices, so nothing is discovered here.
+#   * ``custom_base_url`` accepts https anywhere, and http for localhost/127.0.0.1
+#     only, which is the case a local vLLM or LM Studio server needs. Credentials,
+#     a query string or a fragment in the URL are refused, so a key cannot ride along.
+#   * No provider routing object and no max_price ceiling: a generic server may
+#     reject ``provider`` or ignore it, and there is no catalogue to price against.
+#   * Prices come from the person (USD per 1M tokens, zero allowed for local servers
+#     and subscription plans) and are held in the catalog row. The receipt is priced
+#     from those rates, never from a provider-reported charge, so the ledger stays
+#     comparable with the other transports.
+#   * No thinking control: ``reasoning_enabled`` is refused rather than silently
+#     dropped, because a generic endpoint has no agreed field for it.
+CUSTOM = "custom"
+CUSTOM_ANSWER_TOKENS = {"surface": 1024, "deep": 4096, "reflection": 4096, "memory_write": 4096}
+_CUSTOM_API_MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,79}")
+_CUSTOM_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def custom_base_url(url, *, allow_local_http=True):
+    """The OpenAI-compatible base URL the person typed, normalised, ending in /v1.
+
+    https is required except for a loopback host, where http is accepted when
+    ``allow_local_http`` is true. No credentials, query, fragment or whitespace.
+    """
+    from urllib.parse import urlsplit
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("A base URL is required")
+    if any(ch.isspace() for ch in url.strip()):
+        raise ValueError("The base URL must not contain spaces")
+    parts = urlsplit(url.strip())
+    try:
+        port = parts.port
+    except ValueError:
+        raise ValueError("Invalid port in the base URL") from None
+    host = (parts.hostname or "").lower()
+    if not host:
+        raise ValueError("The base URL needs a host")
+    if parts.username or parts.password or parts.query or parts.fragment:
+        raise ValueError("The base URL cannot carry credentials, a query or a fragment")
+    local = host in _CUSTOM_LOCAL_HOSTS
+    if parts.scheme == "http":
+        if not (allow_local_http and local):
+            raise ValueError("http is accepted for localhost only; use https")
+    elif parts.scheme != "https":
+        raise ValueError("The base URL must be https, or http on localhost")
+    if parts.path.rstrip("/") != "/v1":
+        raise ValueError("Use the OpenAI-compatible base ending in /v1")
+    netloc = host if port is None else host + ":" + str(port)
+    return parts.scheme + "://" + netloc + "/v1"
+
+
+def _custom_prices(raw, label):
+    if not isinstance(raw, dict):
+        raise ValueError("Prices are required for " + label)
+    prices = {}
+    for key in ("input", "output", "cache_read"):
+        value = raw.get(key)
+        if value is None and key == "cache_read":
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError("Prices must be finite numbers at or above zero: " + label)
+        prices[key] = float(value)
+    return prices
+
+
+def load_custom_catalog(path):
+    """Read the person's config/custom_models.json: endpoint, models and their prices.
+
+    Nothing is discovered and nothing is defaulted: a row without both an input and
+    an output price is refused, because the meter will not reserve an unpriced model.
+    """
+    data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    if not isinstance(data, dict) or data.get("version") != 1 or data.get("provider") != CUSTOM:
+        raise ValueError("Invalid custom model catalog")
+    endpoint = data.get("endpoint") if isinstance(data.get("endpoint"), dict) else {}
+    base = custom_base_url(endpoint.get("base_url"))
+    models = {}
+    for row in data.get("models") or []:
+        if not isinstance(row, dict):
+            raise ValueError("Custom catalog rows must be objects")
+        api = row.get("api_model")
+        if not isinstance(api, str) or not _CUSTOM_API_MODEL.fullmatch(api) or row.get("model_id") != CUSTOM + "/" + api:
+            raise ValueError("A custom row needs model_id custom/<api_model>")
+        prices = _custom_prices(row.get("prices"), api)
+        if "input" not in prices or "output" not in prices:
+            raise ValueError("A custom row needs input and output prices: " + api)
+        context = row.get("context")
+        if context is not None and (isinstance(context, bool) or not isinstance(context, int) or context <= 0):
+            raise ValueError("A custom row context must be a positive integer: " + api)
+        if row.get("model_id") in models:
+            raise ValueError("Custom catalog needs unique model IDs")
+        models[row["model_id"]] = {"model_id": row["model_id"], "api_model": api, "context": context,
+                                  "prices": prices, "json_mode": row.get("json_mode")}
+    if not models:
+        raise ValueError("Custom catalog has no models")
+    return {"base": base, "models": models}
+
+
+def custom_price(catalog, model_id, pricing=None):
+    """The price entry for one custom model, from the person's catalog row."""
+    models = (catalog or {}).get("models") or {}
+    row = models.get(model_id)
+    if row is None:
+        raise ValueError("Unknown custom model")
+    prices = dict(row["prices"])
+    prices.setdefault("cache_read", prices["input"])
+    return {"input": prices["input"], "output": prices["output"], "cache_read": prices["cache_read"],
+            "model_id": model_id, "source": "person", "checked_at": None}
+
+
+def custom_cost(price, tokens):
+    """(USD, basis) for one call from normalised token counts and the person's rates."""
+    rates = {"input": price["input"], "output": price["output"], "cache_read": price["cache_read"]}
+    cost = (tokens["input_uncached_tokens"] * rates["input"] + tokens["cache_read_tokens"] * rates["cache_read"]
+            + tokens["output_tokens"] * rates["output"]) / 1e6
+    return cost, {"usd_per_million": rates, "price_source": price.get("source")}
+
+
+def normalize_custom_usage(raw, price):
+    """OpenAI-style usage -> the normalize_usage() shape, priced at the person's rates.
+
+    Missing counts leave the cost unknown, so the reservation stays held.
+    """
+    raw = raw if isinstance(raw, dict) else {}
+    issues = []
+    def count(key, required=False):
+        value = raw.get(key)
+        if value is None and not required:
+            return 0
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            issues.append("invalid_or_missing_" + key)
+            return 0
+        return value
+    prompt = count("prompt_tokens", True)
+    completion = count("completion_tokens", True)
+    details = raw.get("prompt_tokens_details")
+    details = details if isinstance(details, dict) else {}
+    cached = details.get("cached_tokens")
+    cached = cached if isinstance(cached, int) and not isinstance(cached, bool) and cached >= 0 else 0
+    if cached > prompt:
+        issues.append("cache_tokens_exceed_prompt")
+    details_out = raw.get("completion_tokens_details")
+    details_out = details_out if isinstance(details_out, dict) else {}
+    reasoning = details_out.get("reasoning_tokens")
+    reasoning = reasoning if isinstance(reasoning, int) and not isinstance(reasoning, bool) and reasoning >= 0 else 0
+    tokens = {"total_input_tokens": prompt, "input_uncached_tokens": max(0, prompt - cached),
+              "cache_read_tokens": cached, "cache_write_tokens": 0, "output_tokens": completion,
+              "reasoning_tokens": reasoning, "total_tokens": prompt + completion}
+    cost = basis = None
+    if not isinstance(price, dict) or "input" not in price:
+        issues.append("missing_price")
+    elif not issues:
+        cost, basis = custom_cost(price, tokens)
+    return {"cost_usd": cost, "complete": not issues and cost is not None, "issues": issues, "warnings": [],
+            "cost_source": "price_table", "price_basis": basis, "tokens": tokens}
+
+
+def custom_role_config(catalog, model_id, role, *, max_tokens=None, reasoning_enabled=None, pricing=None):
+    """Conservative per-role parameters for one custom model."""
+    role = "memory_write" if role == "memory_extraction" else role
+    models = (catalog or {}).get("models") or {}
+    if role not in ROLES or model_id not in models:
+        raise ValueError("Unknown role or custom model")
+    row = models[model_id]
+    if reasoning_enabled:
+        raise ValueError("Custom endpoints have no reasoning control; leave it off")
+    answer = CUSTOM_ANSWER_TOKENS[role] if max_tokens is None else max_tokens
+    if isinstance(answer, bool) or not isinstance(answer, int) or not 1 <= answer <= MAX_OUTPUT_TOKENS:
+        raise ValueError("max_tokens must be an integer between 1 and 8192")
+    price = custom_price(catalog, model_id, pricing)
+    json_mode = row.get("json_mode")
+    if json_mode not in (None, "json_object", "json_schema"):
+        raise ValueError("json_mode must be json_object, json_schema or absent")
+    if role == "memory_write" and json_mode != "json_schema":
+        raise ValueError("The memory writer needs an endpoint that supports a JSON schema")
+    ceiling = {"prompt": max(price["input"], price["cache_read"]), "completion": price["output"], "request": 0.0}
+    return {"transport": CUSTOM, "model_id": model_id, "api_model": row["api_model"], "canonical_slug": row["api_model"],
+            "provider_tag": CUSTOM, "provider_name": "Custom OpenAI-compatible", "quantization": None, "role": role,
+            "max_tokens": answer, "request_max_tokens": answer, "output_cap_total": answer, "cap_param": "max_tokens",
+            "thinking_mode": "never", "reasoning_enabled": False, "mandatory_reasoning": False,
+            "thinking_budget": None, "reasoning_effort": None, "reasoning": None,
+            "json_mode": json_mode, "implicit_cache": price["cache_read"] > 0,
+            "max_price": ceiling, "reservation_input_rate": ceiling["prompt"], "price": price,
+            "endpoint_context_tokens": row.get("context"), "endpoint_max_completion_tokens": None,
+            "supported_parameters": [], "structured_outputs_advertised": json_mode == "json_schema",
+            "snapshot_time": None}
+
+
+def make_custom_body(config, messages, *, stream=True, json_schema=None):
+    """OpenAI-compatible request for a generic endpoint: no routing, no provider fields."""
+    if config.get("transport") != CUSTOM or config.get("role") not in ROLES or not config.get("api_model"):
+        raise ValueError("Use a validated custom role config")
+    if not isinstance(messages, list) or not messages:
+        raise ValueError("A nonempty message list is required")
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") not in {"system", "user", "assistant"}:
+            raise ValueError("Only system, user, and assistant text messages are supported")
+        if not isinstance(message.get("content"), str):
+            raise ValueError("This transport accepts text-only messages")
+    body = {"model": config["api_model"], "messages": copy.deepcopy(messages), "stream": bool(stream),
+            "max_tokens": config["request_max_tokens"]}
+    if stream:
+        body["stream_options"] = {"include_usage": True}
+    mode = config.get("json_mode") if (config["role"] == "memory_write" or json_schema is not None) else None
+    if json_schema is not None and mode != "json_schema":
+        raise ValueError("JSON schema is unsupported by this endpoint")
+    if mode == "json_schema":
+        body["response_format"] = {"type": "json_schema", "json_schema": {
+            "name": "amika_memory_facts", "strict": True, "schema": copy.deepcopy(json_schema or FACT_SCHEMA)}}
+    elif mode == "json_object":
+        if not any("json" in message["content"].lower() for message in messages):
+            raise ValueError("JSON object mode requires the word JSON in the prompt")
+        body["response_format"] = {"type": "json_object"}
+    _body_size(body, config)
+    return body
+
+
+def estimate_custom_reservation(config, body):
+    """Conservative bound at the person's own rates, plus the same margin as the others."""
+    _, bound = _body_size(body, config)
+    price = config["max_price"]
+    value = (bound * config["reservation_input_rate"] + config["output_cap_total"] * price["completion"]) / 1e6
+    return value * 1.10 + 0.00001
+
+
+class CustomClient(OpenRouterClient):
+    """A person-supplied OpenAI-compatible endpoint with OpenRouter's receipts and metering."""
+
+    transport = CUSTOM
+
+    def __init__(self, http, api_key, before_call, after_call, *, base_url, timeout=(10, 120), event_sink=None,
+                 drainer=None):
+        super().__init__(http, api_key, before_call, after_call, timeout=timeout, event_sink=event_sink,
+                         drainer=drainer)
+        self.chat_url = custom_base_url(base_url) + "/chat/completions"
+
+    def _chat_body(self, config, messages, *, stream, json_schema=None):
+        return make_custom_body(config, messages, stream=stream, json_schema=json_schema)
+
+    def _reservation(self, config, body):
+        return estimate_custom_reservation(config, body)
+
+    def _prepare(self, config, body, metadata, url):
+        handle, receipt = super()._prepare(config, body, metadata, url)
+        receipt[CUSTOM] = {"api_model": config["api_model"], "price": copy.deepcopy(config["price"])}
+        return handle, receipt
+
+    def _usage(self, receipt, embedding):
+        info = receipt.get(CUSTOM) or {}
+        return normalize_custom_usage(receipt["raw_usage"], info.get("price"))
+
+    def _post(self, url, body, stream):
+        return self.http.post(url, headers={"Authorization": "Bearer " + self._key, "Content-Type": "application/json"},
+                              json=body, stream=stream, timeout=self.timeout, allow_redirects=False)
+
+    def _event(self, config, receipt, data):
+        if not isinstance(data, dict):
+            raise OpenRouterError("Provider returned a non-object event")
+        if data.get("id"):
+            receipt["request_id"] = str(data["id"])
+        if data.get("model"):
+            receipt["actual_model"] = str(data["model"])
+        receipt["actual_provider"] = CUSTOM
+        if isinstance(data.get("usage"), dict):
+            _merge(receipt["raw_usage"], data["usage"])
+        if data.get("error"):
+            raise OpenRouterError("The endpoint returned an error event")
+        if self.event_sink:
+            self.event_sink(copy.deepcopy(data))
+        actual = receipt["actual_model"]
+        api = config.get("api_model") or ""
+        if actual and actual not in (api, config.get("model_id")) and "model_mismatch" not in receipt["issues"]:
+            receipt["issues"].append("model_mismatch")
+
+    def embed(self, *args, **kwargs):
+        raise ValueError("The custom transport serves chat roles only")
+
+
+def fetch_custom_models(http, key, base_url, *, timeout=(5, 20)):
+    """Model IDs the endpoint serves (``GET {base}/models``): one read-only call, no retry."""
+    if not key:
+        raise OpenRouterAuthError("no_key")
+    url = custom_base_url(base_url) + "/models"
+    response = http.get(url, headers={"Authorization": "Bearer " + key}, timeout=timeout, allow_redirects=False)
+    try:
+        status = getattr(response, "status_code", 200)
+        if status in (401, 403):
+            raise OpenRouterAuthError("http_" + str(status))
+        if status != 200:
+            raise OpenRouterHTTPError(status)
+        try:
+            payload = response.json()
+        except ValueError:
+            raise OpenRouterError("malformed_json") from None
+    finally:
+        with contextlib.suppress(Exception):
+            response.close()
+    rows = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        raise OpenRouterError("malformed_payload")
+    return sorted({row["id"] for row in rows if isinstance(row, dict) and isinstance(row.get("id"), str)})
