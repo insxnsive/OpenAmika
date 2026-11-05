@@ -88,7 +88,7 @@ def _money(value):
 _EMBEDDING_PHASES=('query_embedding','memory_embedding')
 # Ledger providers whose calls go through f_roles' transports (OpenRouter, Alibaba Model Studio):
 # their call_receipt comes from F_OR_AFTER_CALL with stream timing, never from the meter listener.
-_ROLE_TRANSPORTS=('openrouter','alibaba','ollama')
+_ROLE_TRANSPORTS=('openrouter','alibaba','ollama','custom')
 _NULL_TOKENS={'input_tokens':None,'cached_tokens':None,'output_tokens':None}
 
 

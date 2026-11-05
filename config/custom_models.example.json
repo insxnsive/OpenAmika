@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "provider": "custom",
+  "_note": "Copy this to config/custom_models.json (machine-local, git-ignored) and edit it. Nothing here is discovered: the model ids and prices are yours, and the key goes only to the URL below.",
+  "endpoint": {
+    "base_url": "https://opencode.ai/zen/v1"
+  },
+  "models": [
+    {
+      "model_id": "custom/glm-5.3-flash",
+      "api_model": "glm-5.3-flash",
+      "context": 131072,
+      "prices": {
+        "input": 0.0,
+        "output": 0.0
+      },
+      "json_mode": null
+    },
+    {
+      "model_id": "custom/deepseek-v4.1-flash",
+      "api_model": "deepseek-v4.1-flash",
+      "context": 131072,
+      "prices": {
+        "input": 0.25,
+        "output": 1.0,
+        "cache_read": 0.05
+      },
+      "json_mode": null
+    }
+  ]
+}

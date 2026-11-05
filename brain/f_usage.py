@@ -51,7 +51,7 @@ RATE_KEYS = ("input", "output", "cache_read", "cache_write_5m", "cache_write_1h"
 STATUS_VALUES = {"complete", "drained", "cancelled", "failed", "unknown"}
 FINAL_STATUSES = ("complete", "drained")
 # Providers that report tokens but no cost; their transport supplies the price-table amount.
-PRICE_TABLE_PROVIDERS = {"alibaba"}
+PRICE_TABLE_PROVIDERS = {"alibaba", "custom"}
 # Prompt cache. Embeddings are never served from a prompt cache; rows written before the
 # per-row ``cache_reported`` flag existed are judged by what their provider normally reports.
 EMBEDDING_PHASES = ("query_embedding", "memory_embedding")
@@ -175,7 +175,7 @@ def normalize_usage(provider: str, usage: dict | None, model: str = "") -> dict:
         else:
             # Anthropic's ordinary cache TTL is five minutes when no split is supplied.
             tokens["cache_write_5m_tokens"] = creation
-    elif provider in {"openai", "xai", "groq", "openrouter", "deepseek", "local", "alibaba"}:   # local = embed_server.py (OpenAI-style usage, zero price)
+    elif provider in {"openai", "xai", "groq", "openrouter", "deepseek", "local", "alibaba", "custom"}:   # local = embed_server.py (OpenAI-style usage, zero price)
         prompt = count("prompt_tokens", required=True)
         embedding = (provider == "openrouter" and "embed" in model.lower()) or provider == "local"
         tokens["output_tokens"] = count("completion_tokens", required=not embedding)

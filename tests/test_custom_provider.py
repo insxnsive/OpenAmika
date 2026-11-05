@@ -10,6 +10,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'brain'))
+from f_roles import NATIVE_KEYS
 from f_openrouter import (CUSTOM, CustomClient, custom_base_url, custom_role_config, custom_cost, custom_price,
                           estimate_custom_reservation, fetch_custom_models, load_custom_catalog, make_custom_body,
                           normalize_custom_usage)
@@ -248,6 +249,82 @@ class ClientTests(unittest.TestCase):
         self.assertFalse(kwargs['allow_redirects'])
         with self.assertRaises(Exception):
             fetch_custom_models(http, '', self.catalog['base'])
+
+
+class RoleWiringTests(unittest.TestCase):
+    """The role manager must accept a custom option without touching any other transport."""
+
+    def setUp(self):
+        import contextlib
+        import shutil
+        import threading
+        from f_memory import MemoryRuntime
+        from f_roles import NATIVE_KEYS, ROLES, install_roles
+        from f_usage import UsageMeter
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / 'config').mkdir()
+        shutil.copyfile(ROOT / 'config' / 'openrouter_models.json', self.root / 'config' / 'openrouter_models.json')
+        self.document = {'version': 1, 'options': {}, 'selections': {}}
+        for role in ROLES:
+            self.document['options'][role] = [
+                {'key': 'custom:' + role, 'name': 'Custom ' + role, 'provider': 'custom',
+                 'model_id': 'custom/glm-5.3-flash'}]
+            self.document['selections'][role] = 'custom:' + role
+        (self.root / 'config' / 'llm_roles.json').write_text(json.dumps(self.document), encoding='utf-8')
+        self.memory = MemoryRuntime(self.root / 'memory_f' / 'live', lambda events, chunk: {'native': True},
+                                    lambda texts, task: [[1.] + [0.] * 767 for _ in texts])
+        self.meter = UsageMeter(self.root / 'memory_f' / 'usage.sqlite', {'models': {}}, budget_usd=1)
+        natives = {key: {'name': key, 'provider': 'native', 'model': key} for key in NATIVE_KEYS.values()}
+        self.g = {'AVAILABLE_MODELS': natives, '_ws_active_lock': threading.RLock(), '_ws_active': {},
+                  '_thinking_inflight': 0, 'http_requests': object(), 'OPENROUTER_KEY': 'fake-key',
+                  'CUSTOM_OPENAI_KEY': 'fake-key',
+                  '_pick_stream': lambda p, c, **kw: iter(['native']),
+                  '_openai_messages': lambda p, **kw: [],
+                  '_extract_surface_fields': lambda raw: {'mode': 'say', 'status': 'ok'},
+                  'parse_surface_response': lambda raw: [], 'parse_response': lambda raw: []}
+
+        @contextlib.contextmanager
+        def scope(phase, turn_id='', **kwargs):
+            yield
+        self.scope = scope
+        self.install_roles = install_roles
+
+    def tearDown(self):
+        self.memory.close()
+        self.tmp.cleanup()
+
+    def install(self):
+        return self.install_roles(self.g, self.root, self.memory, self.meter, self.scope, __import__('threading').local(), {})
+
+    def write_catalog(self):
+        payload = json.loads(json.dumps(CATALOG))
+        payload['models'][0]['json_mode'] = 'json_schema'
+        (self.root / 'config' / 'custom_models.json').write_text(json.dumps(payload), encoding='utf-8')
+
+    def test_configured_option_reaches_the_custom_transport_and_its_rates(self):
+        self.write_catalog()
+        manager = self.install()
+        option = manager.options['surface']['custom:surface']
+        self.assertEqual(option['transport'], 'custom')
+        self.assertEqual(option['config']['transport'], CUSTOM)
+        rates = self.meter.pricing['models']['custom:custom/glm-5.3-flash']
+        self.assertEqual(rates, {'input': 1.0, 'output': 2.0, 'cache_read': 0.25})
+
+    def test_a_missing_catalog_keeps_the_provider_unusable(self):
+        with self.assertRaises(ValueError):
+            self.install()
+
+    def test_a_listed_but_disabled_row_does_not_need_the_catalog(self):
+        for role in list(self.document['options']):
+            self.document['options'][role][0].update(disabled=True, disabled_reason='not configured')
+            native = 'native:' + NATIVE_KEYS[role]
+            self.document['options'][role].append({'key': native, 'native_key': NATIVE_KEYS[role], 'name': 'Native'})
+            self.document['selections'][role] = native
+        (self.root / 'config' / 'llm_roles.json').write_text(json.dumps(self.document), encoding='utf-8')
+        manager = self.install()
+        self.assertTrue(manager.options['surface']['custom:surface']['disabled'])
+
 
 
 if __name__ == '__main__':

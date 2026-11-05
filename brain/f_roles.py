@@ -31,8 +31,9 @@ import threading
 
 from f_extract import SYSTEM, FACT_INSTRUCTION, parse_isolated_facts
 from f_memory import _write
-from f_openrouter import (ALIBABA, AlibabaClient, OpenRouterClient, alibaba_base_url, alibaba_role_config,
-                          embedding_config, load_alibaba_catalog, load_catalog, role_config)
+from f_openrouter import (ALIBABA, CUSTOM, AlibabaClient, CustomClient, OpenRouterClient, alibaba_base_url,
+                          alibaba_role_config, custom_base_url, custom_role_config, embedding_config,
+                          load_alibaba_catalog, load_catalog, load_custom_catalog, role_config)
 from f_ollama import OLLAMA, THINKING_ROLES, OllamaClient, load_ollama_config, ollama_role_config
 
 ROLES = ("surface", "deep", "reflection", "memory_write")
@@ -43,7 +44,7 @@ DEFAULT_NAMES = {"surface": "DEFAULT_SURFACE_MODEL", "deep": "DEFAULT_DEEP_MODEL
 LIST_NAMES = {"surface": "SURFACE_MODEL_KEYS", "deep": "DEEP_MODEL_KEYS", "reflection": "THINKING_MODEL_KEYS"}
 # Role transports (option "provider"); a row without one is OpenRouter. Ollama options are not rows of
 # llm_roles.json: they are generated from config/ollama.json (whatever the local server has pulled).
-PROVIDERS = ("openrouter", ALIBABA, OLLAMA)
+PROVIDERS = ("openrouter", ALIBABA, OLLAMA, CUSTOM)
 # The native memory writer is not an AVAILABLE_MODELS entry; its provider is fixed.
 NATIVE_PROVIDERS = {"claude-sonnet-5": "anthropic"}
 # webui's legacy per-layer model routes (Flask endpoint names) and its model list.
@@ -62,6 +63,9 @@ class RoleManager:
         # Loaded on the first Alibaba option only: a deployment without Alibaba options never
         # depends on config/alibaba_models.json.
         self.alibaba = None
+        # Loaded on the first custom option only: a deployment without one never reads
+        # config/custom_models.json, which stays machine-local.
+        self.custom = None
         # The local server's detected models (config/ollama.json; empty until the Setup page detects them).
         self.ollama = load_ollama_config(self.root)
         self.lock = threading.RLock()
@@ -208,6 +212,14 @@ class RoleManager:
         if transport == OLLAMA:
             return ollama_role_config(self.ollama, row.get("model_id"), role,
                                       reasoning_enabled=row.get("reasoning_enabled"), max_tokens=row.get("max_tokens"))
+        if transport == CUSTOM:
+            if self.custom is None:
+                path = self.root / "config" / "custom_models.json"
+                if not path.is_file():
+                    raise ValueError("Custom options need config/custom_models.json")
+                self.custom = load_custom_catalog(path)
+            return custom_role_config(self.custom, row.get("model_id"), role, pricing=self.pricing,
+                                      max_tokens=row.get("max_tokens"), reasoning_enabled=row.get("reasoning_enabled"))
         if transport == ALIBABA:
             if self.alibaba is None:
                 path = self.root / "config" / "alibaba_models.json"
@@ -227,6 +239,13 @@ class RoleManager:
         if config.get("transport") == OLLAMA:
             # Local: nothing is charged. A priced (zero) entry keeps the meter's budget gate satisfied.
             self.meter.pricing["models"]["ollama:" + config["model_id"]] = {"input": 0.0, "output": 0.0, "cache_read": 0.0}
+            return
+        if config.get("transport") == CUSTOM:
+            # The person's own rates: the transport prices each call from them, and the
+            # meter uses the same numbers for its reservation and its fallback estimate.
+            price = config["price"]
+            self.meter.pricing["models"]["custom:" + config["model_id"]] = {
+                "input": price["input"], "output": price["output"], "cache_read": price["cache_read"]}
             return
         if config.get("transport") == ALIBABA:
             # Model Studio calls are priced by the transport from the reviewed list price and
@@ -466,6 +485,14 @@ def install_roles(g, root, memory, meter, scope, local, pricing):
                 if configured != base:
                     raise RuntimeError("DASHSCOPE_BASE_URL differs from the reviewed Alibaba endpoint")
             return AlibabaClient(g["http_requests"], key, before, after, base_url=base, event_sink=event_sink)
+        if config is not None and config.get("transport") == CUSTOM:
+            key = g.get("CUSTOM_OPENAI_KEY") or os.getenv("CUSTOM_OPENAI_API_KEY")
+            if not key:
+                raise RuntimeError("Custom endpoint key unavailable (CUSTOM_OPENAI_API_KEY)")
+            if manager.custom is None:
+                raise RuntimeError("Custom endpoint needs config/custom_models.json")
+            return CustomClient(g["http_requests"], key, before, after, base_url=manager.custom["base"],
+                                event_sink=event_sink)
         key = g.get("OPENROUTER_KEY") or os.getenv("OPENROUTER_API_KEY")
         return OpenRouterClient(g["http_requests"], key, before, after, event_sink=event_sink)
 
