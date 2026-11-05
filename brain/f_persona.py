@@ -121,6 +121,95 @@ def _write_atomic(path: Path, content: str):
     os.replace(tmp, path)
 
 
+def _commit_custom_config(catalog, payload, key, manager, g, catalog_path, roles_path, env_path, marker_path,
+                          write=None):
+    """Write the catalog, the role rows and the key as one unit, or put every one of them back.
+
+    Held inside the manager's own exclusion and testable on its own: the production route and the
+    tests call this same function, so the rollback, the key publication order and the blocked state
+    are the code that ships, not a copy of it.
+    """
+    from f_roles import sync_custom_rows
+
+    write = write or _write_atomic
+    previous_env_value = os.environ.get("CUSTOM_OPENAI_API_KEY")
+    state = {"wrote": False, "key_written": False, "catalog": None, "roles": None, "env": None}
+
+    def _commit():
+        state["catalog"] = catalog_path.read_text(encoding="utf-8") if catalog_path.is_file() else None
+        state["roles"] = roles_path.read_text(encoding="utf-8") if roles_path.is_file() else None
+        state["env"] = env_path.read_text(encoding="utf-8") if env_path.is_file() else None
+        document = sync_custom_rows(json.loads(po_contract.read_text_bom(roles_path)), catalog)
+        write(catalog_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        state["wrote"] = True
+        write(roles_path, json.dumps(document, ensure_ascii=False, indent=2) + "\n")
+        if key:
+            lines = (state["env"] or "").splitlines()
+            for index, line in enumerate(lines):
+                if line.strip().startswith("CUSTOM_OPENAI_API_KEY="):
+                    lines[index] = "CUSTOM_OPENAI_API_KEY=" + key
+                    break
+            else:
+                lines.append("CUSTOM_OPENAI_API_KEY=" + key)
+            write(env_path, "\n".join(lines) + "\n")
+            state["key_written"] = True
+            # Nothing is observable until the guard is released, so publishing here cannot be seen
+            # paired with the previous catalog.
+            os.environ["CUSTOM_OPENAI_API_KEY"] = key
+        if manager is not None:
+            manager.reload_custom()
+
+    def _restore():
+        if state["key_written"]:
+            if previous_env_value is None:
+                os.environ.pop("CUSTOM_OPENAI_API_KEY", None)
+            else:
+                os.environ["CUSTOM_OPENAI_API_KEY"] = previous_env_value
+        failures = []
+        entries = [(catalog_path, state["catalog"]), (roles_path, state["roles"])]
+        if state["key_written"]:
+            entries.append((env_path, state["env"]))
+        for target, content in entries:
+            try:
+                if content is None:
+                    target.unlink(missing_ok=True)
+                else:
+                    write(target, content)
+            except OSError as restore_error:
+                failures.append(target.name + ": " + str(restore_error))
+        return failures
+
+    guard = manager.custom_write_guard() if manager is not None else contextlib.nullcontext()
+    # Rollback and blocked-state publication stay inside the guard: releasing it first would let a
+    # reader build a client from files mid-restore.
+    with guard:
+        try:
+            _commit()
+        except Exception as error:
+            if not state["wrote"]:
+                raise
+            failures = _restore()
+            if failures:
+                reason = "; ".join(failures)
+                g["_custom_unavailable"] = reason
+                try:
+                    write(marker_path, json.dumps({"reason": reason}, ensure_ascii=False, indent=2) + "\n")
+                except OSError:
+                    pass          # the in-memory flag already blocks this run
+                raise ValueError(
+                    "The save failed and part of it could not be undone (" + reason +
+                    "). Fix the write problem, then save the whole configuration again; she keeps the "
+                    "custom endpoint off until that save succeeds.") from error
+            if isinstance(error, OSError):
+                raise ValueError("Could not write the configuration: " + str(error)) from error
+            raise
+        g.pop("_custom_unavailable", None)     # a clean save is the recovery
+        try:
+            marker_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def install_persona(g):
     app, request, jsonify = g["app"], g["request"], g["jsonify"]
 
@@ -442,6 +531,9 @@ def install_persona(g):
             return jsonify({"ok": False, "error": str(error)}), 400
 
     CUSTOM_CATALOG = BRAIN_DIR.parent / "config" / "custom_models.json"
+    # Written when a save could not be fully undone, and honoured on the next start: a restart alone
+    # does not repair split files, so the provider stays off until a save rewrites the set cleanly.
+    RECOVERY_MARKER = BRAIN_DIR.parent / "config" / "custom_models.recovery.json"
     # One save at a time: the probe file, the two documents and the key are a single unit.
     CUSTOM_SAVE_LOCK = threading.Lock()
     ROLE_DOCUMENT = BRAIN_DIR.parent / "config" / "llm_roles.json"
@@ -514,77 +606,9 @@ def install_persona(g):
                     reason = str(error) if isinstance(error, ValueError) else type(error).__name__
                     warning = (" It did not answer yet (" + reason +
                                "), so check the URL and the key with Test connection.")
-            # One commit under the manager's own exclusion: the same locks set() takes, so no worker
-            # can hold a role choice from before the save and build a client from after it.
-            manager = g.get("F_ROLES")
-            env_path = BRAIN_DIR / ".env"
-            wrote = False
-            key_written = False
-            previous_env_value = os.environ.get("CUSTOM_OPENAI_API_KEY")
-            previous_catalog = previous_roles = previous_env_file = None
-
-            def _commit():
-                nonlocal wrote, key_written, previous_catalog, previous_roles, previous_env_file
-                # Snapshots are read inside the guard: a selection that committed during the network
-                # probe must not be rolled back to an older document by a failed save.
-                previous_catalog = CUSTOM_CATALOG.read_text(encoding="utf-8") if CUSTOM_CATALOG.is_file() else None
-                previous_roles = ROLE_DOCUMENT.read_text(encoding="utf-8") if ROLE_DOCUMENT.is_file() else None
-                previous_env_file = env_path.read_text(encoding="utf-8") if env_path.is_file() else None
-                document = sync_custom_rows(json.loads(po_contract.read_text_bom(ROLE_DOCUMENT)), catalog)
-                _write_atomic(CUSTOM_CATALOG, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-                wrote = True
-                _write_atomic(ROLE_DOCUMENT, json.dumps(document, ensure_ascii=False, indent=2) + "\n")
-                if key:
-                    lines = (previous_env_file or "").splitlines()
-                    for index, line in enumerate(lines):
-                        if line.strip().startswith("CUSTOM_OPENAI_API_KEY="):
-                            lines[index] = "CUSTOM_OPENAI_API_KEY=" + key
-                            break
-                    else:
-                        lines.append("CUSTOM_OPENAI_API_KEY=" + key)
-                    _write_atomic(env_path, "\n".join(lines) + "\n")
-                    key_written = True
-                    # Nothing is observable until the guard is released, so publishing here cannot be
-                    # seen paired with the previous catalog.
-                    os.environ["CUSTOM_OPENAI_API_KEY"] = key
-                if manager is not None:
-                    manager.reload_custom()
-
-            try:
-                guard = manager.custom_write_guard() if manager is not None else contextlib.nullcontext()
-                with guard:
-                    _commit()
-            except Exception as error:
-                if key_written:
-                    if previous_env_value is None:
-                        os.environ.pop("CUSTOM_OPENAI_API_KEY", None)
-                    else:
-                        os.environ["CUSTOM_OPENAI_API_KEY"] = previous_env_value
-                if not wrote:
-                    raise
-                restore_failures = []
-                entries = [(CUSTOM_CATALOG, previous_catalog), (ROLE_DOCUMENT, previous_roles)]
-                if key_written:
-                    entries.append((env_path, previous_env_file))
-                for target, content in entries:
-                    try:
-                        if content is None:
-                            target.unlink(missing_ok=True)
-                        else:
-                            _write_atomic(target, content)
-                    except OSError as restore_error:
-                        restore_failures.append(target.name + ": " + str(restore_error))
-                if restore_failures:
-                    # The files no longer provably agree with the running manager: refuse custom calls
-                    # and further saves until a save succeeds and rewrites the set cleanly.
-                    g["_custom_unavailable"] = "; ".join(restore_failures)
-                    raise ValueError("The save failed and part of it could not be undone (" +
-                                     "; ".join(restore_failures) + "). She will not use the custom "
-                                     "endpoint until a save succeeds. Check the Setup page and restart her.") from error
-                if isinstance(error, OSError):
-                    raise ValueError("Could not write the configuration: " + str(error)) from error
-                raise
-            g.pop("_custom_unavailable", None)     # a clean save is the recovery
+            _commit_custom_config(catalog=catalog, payload=payload, key=key, manager=g.get("F_ROLES"), g=g,
+                                  catalog_path=CUSTOM_CATALOG, roles_path=ROLE_DOCUMENT, env_path=BRAIN_DIR / ".env",
+                                  marker_path=RECOVERY_MARKER)
             note = "Saved. New models are in the role lists now."
             if key:
                 note = "Saved. The key takes effect on her next reply."

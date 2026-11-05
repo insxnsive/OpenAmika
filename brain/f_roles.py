@@ -623,6 +623,14 @@ class RoleManager:
 
 def install_roles(g, root, memory, meter, scope, local, pricing):
     """Called at the end of f_bridge.install, after its native meter wrappers."""
+    marker = Path(root) / "config" / "custom_models.recovery.json"
+    if marker.is_file():
+        try:
+            reason = json.loads(marker.read_text(encoding="utf-8-sig")).get("reason") or "a previous save did not finish"
+        except (OSError, ValueError):
+            reason = "a previous save did not finish"
+        # A restart discards memory, not disk: keep the provider off until a save repairs the set.
+        g["_custom_unavailable"] = reason
     manager = RoleManager(g, root, memory, meter, pricing)
     # f_bridge.start() refuses these native providers before any reservation or request.
     g["F_DISABLED_PROVIDERS"] = dict(manager.disabled_providers)

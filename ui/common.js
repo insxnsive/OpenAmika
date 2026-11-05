@@ -191,7 +191,8 @@
       // the first reply otherwise, which reads to the person as "she is broken".
       try {
         const c = await getJSON("/api/build_f/custom");
-        if (!c.configured) add("err", "Custom endpoint", "no endpoint saved — Setup → Brain → Custom endpoint");
+        if (c.blocked) add("err", "Custom endpoint", "unusable until a save succeeds: " + c.blocked);
+        else if (!c.configured) add("err", "Custom endpoint", "no endpoint saved — Setup → Brain → Custom endpoint");
         else if (!c.key_present) add("err", "Custom endpoint", c.base_url + " has no key saved — Setup → Brain → Custom endpoint");
         else add("ok", "Custom endpoint", c.base_url);
       } catch (_) { add("err", "Custom endpoint", "status unavailable"); }

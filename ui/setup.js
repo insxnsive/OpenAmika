@@ -295,7 +295,6 @@
     try {
       const info = await getJSON("/api/build_f/custom");
       $("cuUrl").value = info.base_url || "";
-      if (info.blocked) $("cuStatus").textContent = "The custom endpoint is blocked: " + info.blocked;
       if (info.key_hint) {
         $("cuKey").placeholder = info.key_hint === "saved" ? "a key is saved" : "saved: " + info.key_hint;
       }
@@ -306,8 +305,12 @@
       $("cuRows").replaceChildren();
       for (const model of info.models || []) cuAdd(model);
       if (!(info.models || []).length) cuAdd(null);
-      $("cuStatus").textContent = !info.configured ? "not configured yet"
-        : (info.key_present ? "saved" : "saved without a key — add one before she can use it");
+      // One final render, and a blocked endpoint outranks everything else: it is the only state in
+      // which she refuses to use the endpoint at all.
+      $("cuStatus").textContent = info.blocked
+        ? "Blocked: " + info.blocked + " Fix the write problem, then save the whole configuration again."
+        : (!info.configured ? "not configured yet"
+          : (info.key_present ? "saved" : "saved without a key — add one before she can use it"));
       customLoaded = true;
     } catch (error) {
       $("cuStatus").textContent = "status unavailable: " + (error.message || error);

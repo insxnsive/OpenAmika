@@ -282,6 +282,89 @@ class CustomReloadTests(unittest.TestCase):
         self.assertEqual(self.meter.pricing['models']['custom:custom/first']['input'], 1.0)
         self.assertNotIn('surface:custom/missing', self.manager.options['surface'])
 
+    def _commit_args(self, key):
+        from f_persona import _commit_custom_config
+        catalog = self._catalog('custom/first')
+        payload = {'version': 1, 'provider': 'custom',
+                   'endpoint': {'base_url': catalog['base']},
+                   'models': [{'model_id': 'custom/first', 'api_model': 'first',
+                               'prices': {'input': 1.0, 'output': 2.0}, 'json_mode': 'json_schema'}]}
+        return _commit_custom_config, dict(
+            catalog=catalog, payload=payload, key=key, manager=self.manager, g=self.g,
+            catalog_path=self.root / 'config/custom_models.json',
+            roles_path=self.root / 'config/llm_roles.json',
+            env_path=self.root / 'brain/.env', marker_path=self.root / 'config/recovery.json')
+
+    def _seed_env(self):
+        (self.root / 'brain').mkdir(exist_ok=True)
+        (self.root / 'brain/.env').write_text('UNRELATED=keep-me\nCUSTOM_OPENAI_API_KEY=old-key\n',
+                                              encoding='utf-8')
+
+    def test_a_failed_role_write_keeps_the_env_file_when_no_key_was_sent(self):
+        self._seed_env()
+        before = (self.root / 'brain/.env').read_text(encoding='utf-8')
+        commit, args = self._commit_args(key='')
+        calls = {'n': 0}
+
+        def failing_write(path, content):
+            if path.name == 'llm_roles.json':
+                calls['n'] += 1
+                if calls['n'] == 1:          # the save fails here; the restore has to succeed
+                    raise PermissionError('locked')
+            path.write_text(content, encoding='utf-8')
+
+        with self.assertRaises(ValueError):
+            commit(**args, write=failing_write)
+        self.assertEqual((self.root / 'brain/.env').read_text(encoding='utf-8'), before)
+        self.assertFalse((self.root / 'config/recovery.json').exists())
+
+    def test_a_failed_env_write_restores_both_documents_and_the_key(self):
+        self._seed_env()
+        roles_before = (self.root / 'config/llm_roles.json').read_text(encoding='utf-8')
+        commit, args = self._commit_args(key='new-key')
+        with mock.patch.dict(os.environ, {'CUSTOM_OPENAI_API_KEY': 'old-key'}):
+
+            def failing_write(path, content):
+                if path.name == '.env':
+                    raise PermissionError('read-only')
+                path.write_text(content, encoding='utf-8')
+
+            with self.assertRaises(ValueError):
+                commit(**args, write=failing_write)
+            self.assertEqual(os.environ['CUSTOM_OPENAI_API_KEY'], 'old-key')
+        self.assertEqual((self.root / 'config/llm_roles.json').read_text(encoding='utf-8'), roles_before)
+        self.assertFalse((self.root / 'config/custom_models.json').exists())
+
+    def test_a_failed_restore_marks_the_provider_unavailable_on_disk(self):
+        self._seed_env()
+        commit, args = self._commit_args(key='new-key')
+        seen = {'catalog_writes': 0}
+
+        def write(path, content):
+            if path.name == 'llm_roles.json':
+                raise PermissionError('locked')       # the save fails here
+            if path.name == 'custom_models.json':
+                seen['catalog_writes'] += 1
+            path.write_text(content, encoding='utf-8')
+
+        with mock.patch.dict(os.environ, {'CUSTOM_OPENAI_API_KEY': 'old-key'}):
+            with self.assertRaises(ValueError) as raised:
+                commit(**args, write=write)
+        self.assertIn('could not be undone', str(raised.exception))
+        self.assertIn('custom endpoint off', str(raised.exception))
+        self.assertTrue((self.root / 'config/recovery.json').is_file())
+        self.assertIsNotNone(self.g.get('_custom_unavailable'))
+
+    def test_a_clean_save_clears_the_recovery_marker(self):
+        marker = self.root / 'config/recovery.json'
+        marker.write_text('{"reason": "an earlier save"}', encoding='utf-8')
+        self.g['_custom_unavailable'] = 'an earlier save'
+        commit, args = self._commit_args(key='')
+        commit(**args)
+        self.assertFalse(marker.exists())
+        self.assertNotIn('_custom_unavailable', self.g)
+        self.assertIn('custom/first', self.manager.custom['models'])
+
     def test_a_save_refuses_while_memory_work_holds_its_lock(self):
         self._publish('custom/first')
         with self.manager.memory._worker_lock:
