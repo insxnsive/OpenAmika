@@ -1319,7 +1319,9 @@ registerProcessor('pcm-pusher', PCMPusher);`;
         const orPanel = el("div", { class: "body" }), olPanel = el("div", { class: "body", hidden: "" });
         const pick = (which) => {
           orPanel.hidden = which !== "openrouter"; olPanel.hidden = which !== "ollama";
+          cuPanel.hidden = which !== "custom";
           orBtn.setAttribute("aria-pressed", String(which === "openrouter")); olBtn.setAttribute("aria-pressed", String(which === "ollama"));
+          cuBtn.setAttribute("aria-pressed", String(which === "custom"));
           if (which === "ollama") loadOllamaPanel();
         };
         orBtn.addEventListener("click", () => pick("openrouter"));
@@ -1380,11 +1382,32 @@ registerProcessor('pcm-pusher', PCMPusher);`;
         }, "small");
         olPanel.append(el("div", { class: "form-row" }, el("div", { class: "field", style: "flex:2" }, el("label", { text: "Ollama server" }), olUrl), detect), olStatus,
           el("div", { class: "form-row" }, el("div", { class: "field", style: "flex:2" }, el("label", { text: "Model for all four roles" }), olSelect), useBtn), olNote);
-        body.append(choice, orPanel, olPanel);
+        // Custom endpoint: the URL, key and per-model prices are entered in Setup, so the wizard offers a
+        // one-click choice only once a catalog exists there, and otherwise points at the page.
+        const cuBtn = el("button", { type: "button", class: "prov", "aria-pressed": "false", hidden: "" },
+          el("b", { text: "My endpoint" }), el("span", { text: "an OpenAI-compatible URL you already set up" }));
+        const cuPanel = el("div", { class: "body", hidden: "" });
+        const cuNote = el("p", { class: "card-hint", text: "" });
+        const cuUse = button("Use my endpoint", async () => {
+          cuNote.textContent = "switching…";
+          try {
+            await postAction("/api/build_f/preset", "apply-preset", { provider: "custom" });
+            cuNote.textContent = "Her four roles now run on your endpoint.";
+            toast("She now thinks through your endpoint.");
+          } catch (error) { cuNote.textContent = String(error.message || error); toast(String(error.message || error), true); }
+        }, "small primary");
+        cuPanel.append(el("p", { class: "hint", text: "Her four roles switch to the endpoint saved in Setup → Brain → Custom endpoint, at the prices you entered there." }), cuUse, cuNote);
+        const cuHint = el("p", { class: "hint", text: "Using an OpenAI-compatible endpoint? Set it up in Setup → Brain → Custom endpoint, then come back to this step." });
+        choice.append(cuBtn);
+        body.append(choice, orPanel, olPanel, cuPanel, cuHint);
         // start on whichever she already uses
         getJSON("/api/build_f/models").then((m) => {
           const t = (role) => { const item = ((m.options || {})[role] || []).find((o) => o.key === (m.selections || {})[role]); return item ? item.transport : "openrouter"; };
-          pick(["surface", "deep", "reflection", "memory_write"].map(t).every((k) => k === "ollama") ? "ollama" : "openrouter");
+          const transports = ["surface", "deep", "reflection", "memory_write"].map(t);
+          const hasCustom = Object.values(m.options || {}).some((rows) => (rows || []).some((o) => o.transport === "custom"));
+          if (hasCustom) { cuBtn.hidden = false; cuHint.hidden = true; }
+          pick(transports.every((k) => k === "ollama") ? "ollama"
+             : transports.every((k) => k === "custom") ? "custom" : "openrouter");
         }).catch(() => pick("openrouter"));
         actions.append(button("← Back", () => go(2), "small"), button("Skip for now", () => go(4), "small skip"), button("Next →", () => go(4), "primary"));
       } else {

@@ -276,7 +276,9 @@
     try {
       const info = await getJSON("/api/build_f/custom");
       $("cuUrl").value = info.base_url || "";
-      if (info.key_hint) $("cuKey").placeholder = "saved: " + info.key_hint;
+      if (info.key_hint) {
+        $("cuKey").placeholder = info.key_hint === "saved" ? "a key is saved" : "saved: " + info.key_hint;
+      }
       $("cuConfigured").hidden = !info.configured;
       $("cuConfigured").textContent = info.configured
         ? "This endpoint is configured with " + info.models.length + " model(s). Saving replaces them."

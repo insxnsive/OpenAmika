@@ -264,6 +264,66 @@ class RoleManager:
             self._apply(selections)
             return self.get()
 
+    def reload_custom(self):
+        """Re-read config/llm_roles.json and config/custom_models.json after a save, swapping the custom
+        options so the page lists the new models without a restart.
+
+        The save route already rewrote the document, so the file is the source of truth. Rows of every
+        other provider stay untouched. A selection the new document no longer offers falls back the way
+        reload_ollama's does, and a document that cannot be loaded leaves the previous rows in place.
+        """
+        with self.lock:
+            self.custom = None                     # the lazy catalog read has to see the new file
+            document = json.loads(self.path.read_text(encoding="utf-8-sig"))
+            if document.get("version") != 1 or set(document.get("options", {})) != set(ROLES):
+                raise ValueError("Invalid model role configuration version/options")
+            previous = [(role, key, item) for role in ROLES
+                        for key, item in self.options[role].items() if item.get("transport") == CUSTOM]
+            for role, key, _ in previous:
+                del self.options[role][key]
+                self._registrations.pop(key, None)
+                self.g["AVAILABLE_MODELS"].pop(key, None)
+            try:
+                for role in ROLES:
+                    for row in document["options"][role]:
+                        if not isinstance(row, dict) or row.get("provider") != CUSTOM:
+                            continue
+                        key = row.get("key")
+                        if not isinstance(key, str) or not key or key in self.options[role]:
+                            raise ValueError("Model option keys must be nonempty and globally unique")
+                        self.options[role][key] = self._option(role, key, row)
+            except ValueError:
+                # A catalog the manager refuses must not leave the running configuration short of rows.
+                for role, key, item in previous:
+                    self.options[role][key] = item
+                    config = item.get("config") or {}
+                    if config:
+                        self._registrations[key] = {"name": item["name"], "description": item["description"],
+                                                    "provider": item["transport"], "model": config.get("model_id"),
+                                                    "_or_config": config, "_role_config": config}
+                        self.g["AVAILABLE_MODELS"][key] = self._registrations[key]
+                raise
+            self.g["AVAILABLE_MODELS"].update(self._registrations)
+            self.document = document
+            self.disabled_providers = self._disabled_providers(document.get("disabled_providers"))
+            selections = copy.deepcopy(self.selections)
+            for role in ROLES:
+                if selections.get(role) in self.options[role]:
+                    continue
+                preset = self._fallback_preset()
+                chosen = (preset or {}).get("selections", {}).get(role)
+                if chosen not in self.options[role]:
+                    chosen = next(k for k, item in self.options[role].items() if not item.get("disabled"))
+                selections[role] = chosen
+            self.selection_fallback = {}
+            if selections != document.get("selections"):
+                document = copy.deepcopy(document)
+                document["selections"] = selections
+                _write(self.path, document)
+                self.document = document
+            self._apply(selections)
+            return self.get()
+
     def _config(self, role, transport, row):
         if transport == OLLAMA:
             return ollama_role_config(self.ollama, row.get("model_id"), role,

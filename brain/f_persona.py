@@ -519,10 +519,18 @@ def install_persona(g):
                 os.environ["CUSTOM_OPENAI_API_KEY"] = key    # the transport reads it per call
                 note = "Saved. The key takes effect on her next reply; new models need a restart."
             note += warning
+            # The catalog first: the role manager reads it the moment it reloads the rows below.
+            _write_atomic(CUSTOM_CATALOG, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
             document = json.loads(po_contract.read_text_bom(ROLE_DOCUMENT))
             document = sync_custom_rows(document, catalog)
             _write_atomic(ROLE_DOCUMENT, json.dumps(document, ensure_ascii=False, indent=2) + "\n")
-            _write_atomic(CUSTOM_CATALOG, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+            manager = g.get("F_ROLES")
+            if manager is not None:
+                try:
+                    manager.reload_custom()
+                except (ValueError, RuntimeError) as error:
+                    warning += (" The new models could not be loaded yet (" + str(error) +
+                                "); restart her to pick them up.")
             return jsonify({"ok": True, "configured": True, "base_url": catalog["base"],
                             "models": len(catalog["models"]), "note": note,
                             "verified": verified})
