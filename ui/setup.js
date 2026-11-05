@@ -295,6 +295,7 @@
     try {
       const info = await getJSON("/api/build_f/custom");
       $("cuUrl").value = info.base_url || "";
+      if (info.blocked) $("cuStatus").textContent = "The custom endpoint is blocked: " + info.blocked;
       if (info.key_hint) {
         $("cuKey").placeholder = info.key_hint === "saved" ? "a key is saved" : "saved: " + info.key_hint;
       }

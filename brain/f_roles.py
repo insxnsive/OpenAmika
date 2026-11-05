@@ -363,6 +363,9 @@ class RoleManager:
         pair here instead.
         """
         with self.lock:
+            broken = self.g.get("_custom_unavailable")
+            if broken:
+                raise RuntimeError("The custom endpoint is unavailable until a save succeeds: " + broken)
             if self.custom is None:
                 path = self.root / "config" / "custom_models.json"
                 if not path.is_file():
@@ -565,6 +568,29 @@ class RoleManager:
                     self._apply(selections)
                     self.selection_fallback = {}
         return self.get()
+
+    @contextlib.contextmanager
+    def custom_write_guard(self):
+        """The exclusion a catalog save needs, taken exactly as set() takes it.
+
+        The flags alone are not enough: a memory or native worker can pick its role, drop the lock and
+        only build its client later, so a save has to keep dispatch and memory work out for the whole
+        commit rather than sampling them once.
+        """
+        with self.lock, self.g["_ws_active_lock"]:
+            if (self.g.get("_ws_active") or self.g.get("_thinking_inflight", 0)
+                    or self.meter.summary()["active_requests"]):
+                raise RuntimeError("Wait for active conversation/model work")
+            with contextlib.ExitStack() as stack:
+                for name in ("_worker_lock", "_query_lock"):
+                    lock = getattr(self.memory, name)
+                    if not lock.acquire(blocking=False):
+                        raise RuntimeError("Wait for active memory work")
+                    stack.callback(lock.release)
+                with self.memory._lock:
+                    if self.memory._active_retrievals or self.memory.status().get("pending"):
+                        raise RuntimeError("Wait for queued memory work")
+                    yield
 
     def apply_preset(self, name=None, provider=None):
         """Select one validated preset for all four roles: by name, or the provider switch

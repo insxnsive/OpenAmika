@@ -12,6 +12,7 @@ Saves are validated (JSON parse for scenes; check_template for templates — pro
 returned as warnings, the file still saves, matching the boot-time warn-only self-check),
 written atomically, and hot-reloaded into the running brain.
 """
+import contextlib
 import json
 import os
 import threading
@@ -472,7 +473,7 @@ def install_persona(g):
             for model_id, row in catalog["models"].items():
                 models.append({"model_id": model_id, "api_model": row["api_model"], "context": row.get("context"),
                                "prices": row["prices"], "json_mode": row.get("json_mode")})
-        return jsonify({"ok": True, "configured": bool(catalog),
+        return jsonify({"ok": True, "configured": bool(catalog), "blocked": g.get("_custom_unavailable"),
                         "base_url": catalog["base"] if catalog else "", "models": models,
                         "key_hint": _custom_key_hint(),
                         "key_present": bool(os.environ.get("CUSTOM_OPENAI_API_KEY"))})
@@ -499,6 +500,10 @@ def install_persona(g):
             finally:
                 probe.unlink(missing_ok=True)
             key = str(value.get("key") or "").strip()
+            if key and any(character in key for character in ("\x00", "\n", "\r")):
+                # os.environ refuses these, and a refusal after the files were written would leave the
+                # endpoint published with the previous key.
+                raise ValueError("The key contains a character that cannot be saved.")
             warning = ""
             verified = False
             probe_key = key or (os.environ.get("CUSTOM_OPENAI_API_KEY") or "")
@@ -509,30 +514,19 @@ def install_persona(g):
                     reason = str(error) if isinstance(error, ValueError) else type(error).__name__
                     warning = (" It did not answer yet (" + reason +
                                "), so check the URL and the key with Test connection.")
-            # Catalog, role document, key and the live reload are one unit under the manager's lock.
-            # Snapshots are read inside the lock too: a selection that committed while the endpoint was
-            # being probed must not be rolled back to the older document by a failed save.
+            # One commit under the manager's own exclusion: the same locks set() takes, so no worker
+            # can hold a role choice from before the save and build a client from after it.
             manager = g.get("F_ROLES")
-            manager_lock = getattr(manager, "lock", None)
             env_path = BRAIN_DIR / ".env"
-            if manager_lock is not None:
-                manager_lock.acquire()
             wrote = False
             key_written = False
             previous_env_value = os.environ.get("CUSTOM_OPENAI_API_KEY")
-            try:
-                # Rechecked here, after the probe's network wait: a reply or a metered call can start
-                # while the endpoint is being asked, and swapping the endpoint under it is not safe.
-                if g.get("_ws_active") or g.get("_thinking_inflight"):
-                    raise ValueError("Wait for the current reply to finish, then save again.")
-                if manager is not None:
-                    try:
-                        running = manager.meter.summary().get("active_requests") or 0
-                    except Exception:  # noqa: BLE001
-                        # Fail closed: if idleness cannot be proven, do not swap the endpoint.
-                        raise ValueError("Could not confirm she is idle; try again in a moment.") from None
-                    if running:
-                        raise ValueError("Wait for the running model call to finish, then save again.")
+            previous_catalog = previous_roles = previous_env_file = None
+
+            def _commit():
+                nonlocal wrote, key_written, previous_catalog, previous_roles, previous_env_file
+                # Snapshots are read inside the guard: a selection that committed during the network
+                # probe must not be rolled back to an older document by a failed save.
                 previous_catalog = CUSTOM_CATALOG.read_text(encoding="utf-8") if CUSTOM_CATALOG.is_file() else None
                 previous_roles = ROLE_DOCUMENT.read_text(encoding="utf-8") if ROLE_DOCUMENT.is_file() else None
                 previous_env_file = env_path.read_text(encoding="utf-8") if env_path.is_file() else None
@@ -541,8 +535,6 @@ def install_persona(g):
                 wrote = True
                 _write_atomic(ROLE_DOCUMENT, json.dumps(document, ensure_ascii=False, indent=2) + "\n")
                 if key:
-                    # The key file goes down before anything is published, so a failed write is a
-                    # failed save instead of a successful one with a stale key.
                     lines = (previous_env_file or "").splitlines()
                     for index, line in enumerate(lines):
                         if line.strip().startswith("CUSTOM_OPENAI_API_KEY="):
@@ -551,23 +543,25 @@ def install_persona(g):
                     else:
                         lines.append("CUSTOM_OPENAI_API_KEY=" + key)
                     _write_atomic(env_path, "\n".join(lines) + "\n")
-                key_written = bool(key)
+                    key_written = True
+                    # Nothing is observable until the guard is released, so publishing here cannot be
+                    # seen paired with the previous catalog.
+                    os.environ["CUSTOM_OPENAI_API_KEY"] = key
                 if manager is not None:
                     manager.reload_custom()
-                if key:
-                    # Published while the lock is still held, so a client cannot pair a new endpoint
-                    # with the previous key: custom_runtime() reads both under this same lock.
-                    os.environ["CUSTOM_OPENAI_API_KEY"] = key
+
+            try:
+                guard = manager.custom_write_guard() if manager is not None else contextlib.nullcontext()
+                with guard:
+                    _commit()
             except Exception as error:
-                if not wrote:
-                    raise
                 if key_written:
                     if previous_env_value is None:
                         os.environ.pop("CUSTOM_OPENAI_API_KEY", None)
                     else:
                         os.environ["CUSTOM_OPENAI_API_KEY"] = previous_env_value
-                # Restoring is best effort for the disk, but a restore that fails means the install is
-                # no longer provably coherent: say so instead of reporting a normal failure.
+                if not wrote:
+                    raise
                 restore_failures = []
                 entries = [(CUSTOM_CATALOG, previous_catalog), (ROLE_DOCUMENT, previous_roles)]
                 if key_written:
@@ -581,15 +575,16 @@ def install_persona(g):
                     except OSError as restore_error:
                         restore_failures.append(target.name + ": " + str(restore_error))
                 if restore_failures:
+                    # The files no longer provably agree with the running manager: refuse custom calls
+                    # and further saves until a save succeeds and rewrites the set cleanly.
+                    g["_custom_unavailable"] = "; ".join(restore_failures)
                     raise ValueError("The save failed and part of it could not be undone (" +
-                                     "; ".join(restore_failures) + "). Check the Setup page and restart her.") from error
+                                     "; ".join(restore_failures) + "). She will not use the custom "
+                                     "endpoint until a save succeeds. Check the Setup page and restart her.") from error
                 if isinstance(error, OSError):
-                    # A disk error is not the page's permission check; say what actually failed.
                     raise ValueError("Could not write the configuration: " + str(error)) from error
                 raise
-            finally:
-                if manager_lock is not None:
-                    manager_lock.release()
+            g.pop("_custom_unavailable", None)     # a clean save is the recovery
             note = "Saved. New models are in the role lists now."
             if key:
                 note = "Saved. The key takes effect on her next reply."
@@ -597,6 +592,8 @@ def install_persona(g):
             return jsonify({"ok": True, "configured": True, "base_url": catalog["base"],
                             "models": len(catalog["models"]), "note": note,
                             "verified": verified})
+        except RuntimeError as error:
+            return jsonify({"ok": False, "error": str(error)}), 409
         except PermissionError as error:
             return jsonify({"ok": False, "error": str(error)}), 403
         except ValueError as error:

@@ -7,7 +7,9 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'payload'))
@@ -253,28 +255,63 @@ class CustomReloadTests(unittest.TestCase):
 
     def test_the_endpoint_and_key_are_read_as_one_pair(self):
         self._publish('custom/first')
-        os.environ['CUSTOM_OPENAI_API_KEY'] = 'key-one'
-        try:
-            runtime = self.manager.custom_runtime()
-            self.assertEqual(runtime, {'base': 'https://api.example.test/v1', 'key': 'key-one'})
-            with self.assertRaises(RuntimeError):
-                os.environ.pop('CUSTOM_OPENAI_API_KEY')
-                self.manager.custom_runtime()
-        finally:
+        with mock.patch.dict(os.environ, {'CUSTOM_OPENAI_API_KEY': 'key-one'}):
+            self.assertEqual(self.manager.custom_runtime(),
+                             {'base': 'https://api.example.test/v1', 'key': 'key-one'})
+        with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop('CUSTOM_OPENAI_API_KEY', None)
+            with self.assertRaises(RuntimeError):
+                self.manager.custom_runtime()
 
     def test_a_refused_reload_leaves_no_meter_rates_behind(self):
         self._publish('custom/first')
         rates_before = dict(self.meter.pricing['models'])
-        # A row for a model the catalog does not carry: the first role's rows and their rates are built
-        # before this one fails, so a rollback that forgets the meter leaves them installed.
+        # Rebuild the existing model at different rates, so the reload really does change the meter's
+        # map, then fail afterwards on a row naming a model the catalog does not carry.
+        payload = {'version': 1, 'provider': 'custom',
+                   'endpoint': {'base_url': 'https://api.example.test/v1'},
+                   'models': [{'model_id': 'custom/first', 'api_model': 'first', 'prices': {'input': 5.0, 'output': 6.0},
+                               'json_mode': 'json_schema'}]}
+        (self.root / 'config/custom_models.json').write_text(json.dumps(payload), encoding='utf-8')
         self.document['options']['surface'].append(
             {'key': 'surface:custom/missing', 'provider': 'custom', 'model_id': 'custom/missing', 'name': 'Missing'})
         self._save_document()
         with self.assertRaises(ValueError):
             self.manager.reload_custom()
         self.assertEqual(dict(self.meter.pricing['models']), rates_before)
+        self.assertEqual(self.meter.pricing['models']['custom:custom/first']['input'], 1.0)
         self.assertNotIn('surface:custom/missing', self.manager.options['surface'])
+
+    def test_a_save_refuses_while_memory_work_holds_its_lock(self):
+        self._publish('custom/first')
+        with self.manager.memory._worker_lock:
+            with self.assertRaises(RuntimeError):
+                with self.manager.custom_write_guard():
+                    pass
+
+    def test_a_client_build_waits_for_a_save_and_sees_the_new_pair(self):
+        self._publish('custom/first')
+        seen, started = {}, threading.Event()
+
+        def read_runtime():
+            started.set()
+            seen['runtime'] = self.manager.custom_runtime()
+
+        with mock.patch.dict(os.environ, {'CUSTOM_OPENAI_API_KEY': 'key-b'}):
+            with self.manager.custom_write_guard():
+                reader = threading.Thread(target=read_runtime)
+                reader.start()
+                self.assertTrue(started.wait(5))
+                time.sleep(0.05)                      # let the reader reach the lock
+                self.assertNotIn('runtime', seen)     # it cannot see the half-applied save
+                payload = {'version': 1, 'provider': 'custom',
+                           'endpoint': {'base_url': 'https://b.example.test/v1'},
+                           'models': [{'model_id': 'custom/second', 'api_model': 'second',
+                                       'prices': {'input': 1.0, 'output': 2.0}, 'json_mode': 'json_schema'}]}
+                (self.root / 'config/custom_models.json').write_text(json.dumps(payload), encoding='utf-8')
+                self.manager.custom = None
+            reader.join(5)
+        self.assertEqual(seen['runtime'], {'base': 'https://b.example.test/v1', 'key': 'key-b'})
 
     def test_a_catalog_the_manager_refuses_leaves_the_running_state_alone(self):
         self._publish('custom/first')
