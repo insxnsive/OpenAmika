@@ -73,6 +73,12 @@ class BaseUrlTests(unittest.TestCase):
         self.assertEqual(custom_base_url('http://127.0.0.1:4000/openai/v1'),
                          'http://127.0.0.1:4000/openai/v1')
 
+    def test_a_bracketed_ipv6_loopback_keeps_its_brackets(self):
+        self.assertEqual(custom_base_url('http://[::1]/v1'), 'http://[::1]/v1')
+        self.assertEqual(custom_base_url('http://[::1]:8000/v1'), 'http://[::1]:8000/v1')
+        once = custom_base_url('http://[::1]:8000/v1')
+        self.assertEqual(custom_base_url(once), once)
+
     def test_a_dot_segment_in_the_path_is_refused(self):
         for bad in ('https://api.example.test/v1/../v1', 'https://api.example.test/./v1',
                     'https://api.example.test/a//v1', 'https://api.example.test/v1%2f..'):
@@ -126,6 +132,20 @@ class CatalogTests(unittest.TestCase):
         tokens = {'total_input_tokens': 10, 'input_uncached_tokens': 10, 'cache_read_tokens': 0,
                   'cache_write_tokens': 0, 'output_tokens': 5, 'reasoning_tokens': 0, 'total_tokens': 15}
         self.assertEqual(custom_cost(price, tokens)[0], 0.0)
+
+
+    def test_an_unknown_json_mode_is_refused_by_the_catalog_loader(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'catalog.json'
+            for mode in ('yaml', 'json', '', 3):
+                with self.subTest(mode=mode):
+                    document = {'version': 1, 'provider': 'custom',
+                                'endpoint': {'base_url': 'https://api.example.test/v1'},
+                                'models': [{'model_id': 'custom/m', 'api_model': 'm', 'json_mode': mode,
+                                            'prices': {'input': 0, 'output': 0}}]}
+                    path.write_text(json.dumps(document), encoding='utf-8')
+                    with self.assertRaises(ValueError):
+                        load_custom_catalog(path)
 
 
 class RoleConfigTests(unittest.TestCase):

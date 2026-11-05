@@ -14,6 +14,8 @@ written atomically, and hot-reloaded into the running brain.
 """
 import json
 import os
+import threading
+import uuid
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -439,6 +441,8 @@ def install_persona(g):
             return jsonify({"ok": False, "error": str(error)}), 400
 
     CUSTOM_CATALOG = BRAIN_DIR.parent / "config" / "custom_models.json"
+    # One save at a time: the probe file, the two documents and the key are a single unit.
+    CUSTOM_SAVE_LOCK = threading.Lock()
     ROLE_DOCUMENT = BRAIN_DIR.parent / "config" / "llm_roles.json"
 
     def _custom_catalog():
@@ -470,67 +474,81 @@ def install_persona(g):
                                "prices": row["prices"], "json_mode": row.get("json_mode")})
         return jsonify({"ok": True, "configured": bool(catalog),
                         "base_url": catalog["base"] if catalog else "", "models": models,
-                        "key_hint": _custom_key_hint()})
+                        "key_hint": _custom_key_hint(),
+                        "key_present": bool(os.environ.get("CUSTOM_OPENAI_API_KEY"))})
 
     @app.route("/api/build_f/custom", methods=["POST"])
     def custom_provider_set():
+        from f_openrouter import fetch_custom_models, load_custom_catalog
+        from f_roles import sync_custom_rows
+        # Two saves at once would share a probe file and interleave three writes.
+        if not CUSTOM_SAVE_LOCK.acquire(blocking=False):
+            return jsonify({"ok": False, "error": "Another save is already running."}), 409
         try:
-            from f_openrouter import load_custom_catalog
-            from f_roles import sync_custom_rows
             value = action_request("custom-provider")
+            if g.get("_ws_active") or g.get("_thinking_inflight"):
+                raise ValueError("Wait for the current reply to finish, then save again.")
             payload = {"version": 1, "provider": "custom",
                        "endpoint": {"base_url": str(value.get("base_url") or "")},
                        "models": value.get("models")}
-            # Validate through the transport before anything reaches disk.
-            probe = Path(BRAIN_DIR.parent) / "config" / ".custom_models.probe.json"
+            # Validate through the transport before anything reaches disk, in a file nobody else uses.
+            probe = Path(BRAIN_DIR.parent) / "config" / (".custom_models.probe-" + uuid.uuid4().hex + ".json")
             _write_atomic(probe, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
             try:
                 catalog = load_custom_catalog(probe)
             finally:
                 probe.unlink(missing_ok=True)
             key = str(value.get("key") or "").strip()
-            note = "Saved. New models appear in the role lists after she restarts."
-            # Reach the endpoint before anything reaches disk, so a wrong URL or key can never leave a
-            # half-written install behind. Not reaching it is not fatal: configuring ahead of a working
-            # endpoint is legitimate, so the answer just says whether it answered.
             warning = ""
             verified = False
             probe_key = key or (os.environ.get("CUSTOM_OPENAI_API_KEY") or "")
             if probe_key:
                 try:
-                    from f_openrouter import fetch_custom_models
                     verified = bool(fetch_custom_models(g["http_requests"], probe_key, catalog["base"]))
                 except Exception as error:  # noqa: BLE001 - every transport answer is reported, none raised
                     reason = str(error) if isinstance(error, ValueError) else type(error).__name__
                     warning = (" It did not answer yet (" + reason +
                                "), so check the URL and the key with Test connection.")
-            if key:
-                env_path = BRAIN_DIR / ".env"
-                lines = env_path.read_text(encoding="utf-8-sig").splitlines() if env_path.is_file() else []
-                replaced = False
-                for i, line in enumerate(lines):
-                    if line.strip().startswith("CUSTOM_OPENAI_API_KEY="):
-                        lines[i] = "CUSTOM_OPENAI_API_KEY=" + key
-                        replaced = True
-                        break
-                if not replaced:
-                    lines.append("CUSTOM_OPENAI_API_KEY=" + key)
-                _write_atomic(env_path, "\n".join(lines) + "\n")
-                os.environ["CUSTOM_OPENAI_API_KEY"] = key    # the transport reads it per call
-                note = "Saved. The key takes effect on her next reply; new models need a restart."
-            note += warning
-            # The catalog first: the role manager reads it the moment it reloads the rows below.
-            _write_atomic(CUSTOM_CATALOG, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-            document = json.loads(po_contract.read_text_bom(ROLE_DOCUMENT))
-            document = sync_custom_rows(document, catalog)
-            _write_atomic(ROLE_DOCUMENT, json.dumps(document, ensure_ascii=False, indent=2) + "\n")
-            manager = g.get("F_ROLES")
-            if manager is not None:
-                try:
+            # Commit the two documents together, or put both back. A new catalog with the old rows,
+            # or the reverse, is a configuration the manager refuses at the next start.
+            previous_catalog = CUSTOM_CATALOG.read_text(encoding="utf-8") if CUSTOM_CATALOG.is_file() else None
+            previous_roles = ROLE_DOCUMENT.read_text(encoding="utf-8") if ROLE_DOCUMENT.is_file() else None
+            document = sync_custom_rows(json.loads(po_contract.read_text_bom(ROLE_DOCUMENT)), catalog)
+            try:
+                _write_atomic(CUSTOM_CATALOG, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+                _write_atomic(ROLE_DOCUMENT, json.dumps(document, ensure_ascii=False, indent=2) + "\n")
+                manager = g.get("F_ROLES")
+                if manager is not None:
                     manager.reload_custom()
-                except (ValueError, RuntimeError) as error:
-                    warning += (" The new models could not be loaded yet (" + str(error) +
-                                "); restart her to pick them up.")
+            except Exception:
+                if previous_catalog is None:
+                    CUSTOM_CATALOG.unlink(missing_ok=True)
+                else:
+                    _write_atomic(CUSTOM_CATALOG, previous_catalog)
+                if previous_roles is not None:
+                    _write_atomic(ROLE_DOCUMENT, previous_roles)
+                raise
+            note = "Saved. New models are in the role lists now."
+            if key:
+                # Publish the key only once the catalog it belongs to is live, so a reply can never
+                # carry the new key to the previous endpoint. The file first, memory last.
+                env_path = BRAIN_DIR / ".env"
+                try:
+                    lines = env_path.read_text(encoding="utf-8-sig").splitlines() if env_path.is_file() else []
+                    for index, line in enumerate(lines):
+                        if line.strip().startswith("CUSTOM_OPENAI_API_KEY="):
+                            lines[index] = "CUSTOM_OPENAI_API_KEY=" + key
+                            break
+                    else:
+                        lines.append("CUSTOM_OPENAI_API_KEY=" + key)
+                    _write_atomic(env_path, "\n".join(lines) + "\n")
+                except OSError as error:
+                    warning += (" The key could not be written (" + type(error).__name__ +
+                                "), so she keeps the previous one.")
+                else:
+                    os.environ["CUSTOM_OPENAI_API_KEY"] = key
+                    note = "Saved. The key takes effect on her next reply."
+            note += warning
             return jsonify({"ok": True, "configured": True, "base_url": catalog["base"],
                             "models": len(catalog["models"]), "note": note,
                             "verified": verified})
@@ -538,6 +556,8 @@ def install_persona(g):
             return jsonify({"ok": False, "error": str(error)}), 403
         except ValueError as error:
             return jsonify({"ok": False, "error": str(error)}), 400
+        finally:
+            CUSTOM_SAVE_LOCK.release()
 
     @app.route("/api/build_f/custom/test", methods=["POST"])
     def custom_provider_test():

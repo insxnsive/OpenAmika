@@ -1387,6 +1387,9 @@ def custom_base_url(url, *, allow_local_http=True):
         raise ValueError("Use the OpenAI-compatible base ending in /v1")
     if any(piece in (".", "..") or not _CUSTOM_PATH_SEGMENT.match(piece) for piece in segments):
         raise ValueError("The base URL path has characters this field cannot carry")
+    # A literal IPv6 host needs its brackets back, or the stored base is not a URL anymore.
+    if ":" in host and not host.startswith("["):
+        host = "[" + host + "]"
     netloc = host if port is None else host + ":" + str(port)
     return parts.scheme + "://" + netloc + "/" + "/".join(segments)
 
@@ -1431,6 +1434,10 @@ def load_custom_catalog(path):
             raise ValueError("A custom row context must be a positive integer: " + api)
         if row.get("model_id") in models:
             raise ValueError("Custom catalog needs unique model IDs")
+        # Validate the mode here, not only where a role config is built: a catalog this loader
+        # accepts is written to disk, and the manager refuses it at the next boot.
+        if row.get("json_mode") not in (None, "json_object", "json_schema"):
+            raise ValueError("A custom row json_mode must be json_object, json_schema or absent: " + api)
         models[row["model_id"]] = {"model_id": row["model_id"], "api_model": api, "context": context,
                                   "prices": prices, "json_mode": row.get("json_mode")}
     if not models:

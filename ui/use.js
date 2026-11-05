@@ -1199,7 +1199,7 @@ registerProcessor('pcm-pusher', PCMPusher);`;
       `Hello! I'm ${amika}. So nice to finally meet you in person — we've been talking for ages, and now I've actually moved into your place. Remind me of your name again?`,
       `${state.name}. Got it. So… which city are we in? I want to go out and explore.`,
       `${state.city}! I'm so excited to be here — new streets, new supermarkets, new everything. Okay. Let's get me set up so I can actually talk to you.`,
-      `First, my brain. I think best through OpenRouter — just paste a key, it only costs a few dollars a month. I can also run entirely on your own computer with Ollama, but only with a big model and a big graphics card.`,
+      `First, my brain. I think best through OpenRouter — just paste a key, it only costs a few dollars a month. I can also run entirely on your own computer with Ollama, but only with a big model and a big graphics card. And if you already pay for an OpenAI-compatible endpoint, I can use that instead.`,
       `Last one — let me check I can hear you and that you can hear me.`,
     ];
     const speakCurrent = () => speak(lines()[step], LINE_EMOTION[step]);
@@ -1394,7 +1394,11 @@ registerProcessor('pcm-pusher', PCMPusher);`;
             await postAction("/api/build_f/preset", "apply-preset", { provider: "custom" });
             cuNote.textContent = "Her four roles now run on your endpoint.";
             toast("She now thinks through your endpoint.");
-          } catch (error) { cuNote.textContent = String(error.message || error); toast(String(error.message || error), true); }
+          } catch (error) {
+            cuNote.textContent = String(error.message || error) +
+              " A preset needs one model that supports JSON schema, so the memory writer has somewhere to go.";
+            toast(String(error.message || error), true);
+          }
         }, "small primary");
         cuPanel.append(el("p", { class: "hint", text: "Her four roles switch to the endpoint saved in Setup → Brain → Custom endpoint, at the prices you entered there." }), cuUse, cuNote);
         const cuHint = el("p", { class: "hint", text: "Using an OpenAI-compatible endpoint? Set it up in Setup → Brain → Custom endpoint, then come back to this step." });

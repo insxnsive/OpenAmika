@@ -568,8 +568,9 @@ def install_roles(g, root, memory, meter, scope, local, pricing):
     def after(handle, receipt):
         # Settle billing first. An archive disk error must not erase a paid call.
         transport = receipt.get("transport") or "openrouter"
-        # Model Studio reports no cost: its receipt carries the price-table amount. Ollama costs nothing.
-        extra = ({"reported_cost_usd": receipt.get("cost_usd")} if transport == ALIBABA
+        # Model Studio reports no cost and a custom endpoint may report one in its own extension:
+        # both receipts carry the amount priced from the rates the person was shown. Ollama costs nothing.
+        extra = ({"reported_cost_usd": receipt.get("cost_usd")} if transport in (ALIBABA, CUSTOM)
                  else {"reported_cost_usd": 0.0} if transport == OLLAMA else {})
         meter.finish(handle, usage=receipt["raw_usage"] or None, status=receipt["status"],
                      actual_model=receipt.get("actual_model"), actual_provider=receipt.get("actual_provider"),

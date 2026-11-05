@@ -221,6 +221,7 @@
     $("provOpenrouter").setAttribute("aria-pressed", String(which === "openrouter"));
     $("provOllama").setAttribute("aria-pressed", String(which === "ollama"));
     $("provCustom").setAttribute("aria-pressed", String(which === "custom"));
+    if (which === "custom") loadCustom();
   }
   $("provOpenrouter").addEventListener("click", () => { provChosen = true; showProvider("openrouter"); });
   $("provOllama").addEventListener("click", () => { provChosen = true; showProvider("ollama"); loadOllama(); });
@@ -248,17 +249,28 @@
     remove.addEventListener("click", () => row.remove());
     row.append(api, context, priceIn, priceOut, schema, remove);
     row._read = () => {
+      row._invalid = "";
       const apiModel = api.querySelector("input").value.trim();
       if (!apiModel) return null;
-      const number = (field, fallback) => {
-        const raw = field.querySelector("input").value.trim();
-        return raw === "" ? fallback : Number(raw);
-      };
+      const rawIn = priceIn.querySelector("input").value.trim();
+      const rawOut = priceOut.querySelector("input").value.trim();
+      // Zero is a legitimate price, so a blank field is a mistake, not a zero: the catalog refuses
+      // an unpriced model and the meter would otherwise reserve nothing for a paid one.
+      if (rawIn === "" || rawOut === "") {
+        row._invalid = "Fill in both prices for " + apiModel + " (0 is a valid price).";
+        return null;
+      }
+      const loaded = row._loaded || {};
+      const values = { input: Number(rawIn), output: Number(rawOut) };
+      // cache_read and json_object are shown as the catalog holds them; the panel cannot edit them.
+      if (loaded.prices && typeof loaded.prices.cache_read === "number") values.cache_read = loaded.prices.cache_read;
+      const jsonMode = check.checked ? "json_schema" : (loaded.json_mode === "json_object" ? "json_object" : null);
       return { model_id: "custom/" + apiModel, api_model: apiModel,
-               context: number(context, null) || null,
-               prices: { input: number(priceIn, 0), output: number(priceOut, 0), cache_read: number(priceIn, 0) },
-               json_mode: check.checked ? "json_schema" : null };
+               context: (context.querySelector("input").value.trim() === "" ? null
+                         : Number(context.querySelector("input").value.trim())) || null,
+               prices: values, json_mode: jsonMode };
     };
+    row._loaded = model || {};
     return row;
   }
   function cuRows() { return Array.from($("cuRows").children); }
@@ -286,7 +298,8 @@
       $("cuRows").replaceChildren();
       for (const model of info.models || []) cuAdd(model);
       if (!(info.models || []).length) cuAdd(null);
-      $("cuStatus").textContent = info.configured ? "saved" : "not configured yet";
+      $("cuStatus").textContent = !info.configured ? "not configured yet"
+        : (info.key_present ? "saved" : "saved without a key — add one before she can use it");
       customLoaded = true;
     } catch (error) {
       $("cuStatus").textContent = "status unavailable: " + (error.message || error);
@@ -304,7 +317,11 @@
   });
   $("cuSave").addEventListener("click", async () => {
     const models = cuCollect();
-    if (!models.length) { $("cuStatus").textContent = "Add at least one model first."; return; }
+    if (!models.length) {
+      const invalid = cuRows().map((row) => row._invalid).find(Boolean);
+      $("cuStatus").textContent = invalid || "Add at least one model first.";
+      return;
+    }
     $("cuStatus").textContent = "saving…";
     try {
       const r = await postAction("/api/build_f/custom", "custom-provider",
