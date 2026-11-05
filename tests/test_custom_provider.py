@@ -327,5 +327,49 @@ class RoleWiringTests(unittest.TestCase):
 
 
 
+class SyncRowsTests(unittest.TestCase):
+    """Saving a catalog rewrites only the custom rows and leaves the rest of the document alone."""
+
+    def document(self):
+        return {"version": 1, "fallback_preset": "Lean",
+                "options": {role: [{"key": "or:" + role, "model_id": "deepseek/deepseek-v4-flash-0731"}] for role in
+                            ("surface", "deep", "reflection", "memory_write")},
+                "selections": {"surface": "or:surface", "deep": "or:deep", "reflection": "or:reflection",
+                               "memory_write": "or:memory_write"},
+                "presets": [{"name": "Lean", "selections": {"surface": "or:surface", "deep": "or:deep",
+                                                            "reflection": "or:reflection",
+                                                            "memory_write": "or:memory_write"}}]}
+
+    def catalog(self, json_mode=None):
+        payload = json.loads(json.dumps(CATALOG))
+        payload['models'][0]['json_mode'] = json_mode
+        return load_custom_catalog(write_catalog(payload))
+
+    def test_rows_skip_the_writer_without_a_declared_schema(self):
+        from f_roles import sync_custom_rows
+        document = sync_custom_rows(self.document(), self.catalog())
+        self.assertEqual([r['key'] for r in document['options']['surface'] if r.get('provider') == 'custom'],
+                         ['surface:custom/glm-5.3-flash'])
+        self.assertEqual([r for r in document['options']['memory_write'] if r.get('provider') == 'custom'], [])
+
+    def test_a_schema_capable_catalog_also_writes_one_preset(self):
+        from f_roles import sync_custom_rows
+        document = sync_custom_rows(self.document(), self.catalog('json_schema'))
+        custom_presets = [p for p in document['presets'] if p.get('provider') == 'custom']
+        self.assertEqual(len(custom_presets), 1)
+        self.assertEqual(set(custom_presets[0]['selections']), {'surface', 'deep', 'reflection', 'memory_write'})
+        self.assertEqual(document['selections']['surface'], 'or:surface')
+
+    def test_a_selection_on_a_removed_custom_row_falls_back(self):
+        from f_roles import sync_custom_rows
+        document = self.document()
+        document['options']['surface'].append({'key': 'surface:custom/gone', 'provider': 'custom',
+                                               'model_id': 'custom/gone'})
+        document['selections']['surface'] = 'surface:custom/gone'
+        document = sync_custom_rows(document, self.catalog())
+        self.assertEqual(document['selections']['surface'], 'or:surface')
+
+
+
 if __name__ == '__main__':
     unittest.main()

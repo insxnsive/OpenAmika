@@ -52,6 +52,62 @@ MODEL_ROUTES = ("api_surface_model", "api_deep_model", "api_thinking_model")
 MODEL_LIST_ROUTE = "get_models"
 
 
+def custom_option_rows(catalog):
+    """Option rows for the custom catalog, per role.
+
+    The memory writer is included only for a model that declared a JSON schema, because
+    that role requires strict structured output and would otherwise be offered an option
+    the manager refuses at selection time.
+    """
+    base = (catalog or {}).get("base") or ""
+    host = base.split("://", 1)[-1].split("/", 1)[0]
+    rows = {}
+    for model_id, row in ((catalog or {}).get("models") or {}).items():
+        for role in ROLES:
+            if role == "memory_write" and row.get("json_mode") != "json_schema":
+                continue
+            rows.setdefault(role, []).append({
+                "key": role + ":" + model_id,
+                "name": row["api_model"] + " (custom endpoint)",
+                "description": "Sends to " + host + ", priced at the rates you entered.",
+                "provider": CUSTOM, "model_id": model_id})
+    return rows
+
+
+def sync_custom_rows(document, catalog):
+    """The role document with this catalog's custom rows and one preset, leaving the rest alone.
+
+    Rows and presets from an earlier catalog are replaced. A selection that pointed at a
+    removed custom row falls back to the fallback preset, then to the first offered option,
+    so a re-saved catalog can never leave the document pointing at nothing.
+    """
+    document = copy.deepcopy(document)
+    rows = custom_option_rows(catalog)
+    for role in ROLES:
+        kept = [row for row in document["options"][role] if row.get("provider") != CUSTOM]
+        document["options"][role] = kept + rows.get(role, [])
+    presets = [p for p in document.get("presets", []) if isinstance(p, dict) and p.get("provider") != CUSTOM]
+    fallback = next((p for p in presets if p.get("name") == document.get("fallback_preset")), None)
+    selections = dict(document["selections"])
+    for role in ROLES:
+        offered = {row["key"] for row in document["options"][role] if not row.get("disabled")}
+        if selections.get(role) in offered:
+            continue
+        chosen = (fallback or {}).get("selections", {}).get(role)
+        if chosen not in offered:
+            chosen = next((row["key"] for row in document["options"][role] if not row.get("disabled")), None)
+        if chosen is None:
+            raise ValueError("No usable model is left for the " + role + " role")
+        selections[role] = chosen
+    document["selections"] = selections
+    if all(rows.get(role) for role in ROLES):
+        host = (catalog.get("base") or "").split("://", 1)[-1].split("/", 1)[0]
+        presets.append({"name": "Custom endpoint: " + host, "provider": CUSTOM,
+                        "selections": {role: rows[role][0]["key"] for role in ROLES}})
+    document["presets"] = presets
+    return document
+
+
 class RoleManager:
     def __init__(self, g, root, memory, meter, pricing=None):
         self.g, self.root, self.memory, self.meter = g, Path(root), memory, meter

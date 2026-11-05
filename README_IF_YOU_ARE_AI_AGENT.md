@@ -393,6 +393,10 @@ first: in almost all cases it is the better setup, and it costs a few dollars a 
   below). Do not set the person up on one because it is what fits their GPU: recommend Semi-Local, or Ollama on a
   second machine, instead.
 
+- **Custom endpoint (opt in)**: any OpenAI-compatible URL, such as OpenCode Go, DeepSeek, Groq, Together, a vLLM or LM Studio server. It is off until the person configures it. Setup → Brain → Custom endpoint asks for the base URL (it must end in `/v1`), the key, and one row per model holding the price the person pays in USD per 1M input and output tokens. Nothing is discovered, and prices cannot be left blank because `f_usage` refuses an unpriced model before a call: zero is the right answer for a local server or a subscription plan. `http://` is accepted only for `localhost`, `127.0.0.1` and `::1`, and a URL carrying credentials, a query string or a fragment is refused. The catalog is `config/custom_models.json` (git-ignored; `config/custom_models.example.json` shows the shape), and the key is `CUSTOM_OPENAI_API_KEY` in `brain/.env`. Saving also writes one option row per model into `config/llm_roles.json` so the roles can pick it; the memory writer only appears for a model whose row declares JSON schema support, because that role needs strict structured output. New models load when she restarts, the key on her next reply.
+
+  Worked example, OpenCode Go: base URL `https://opencode.ai/zen/v1`, the key from the OpenCode dashboard, one row with model id `glm-5.3-flash` and context `131072`. On a subscription plan both prices are `0`; per-token billing uses the plan's listed rates. *Test connection* calls `GET {base}/models` and lists what the endpoint serves, so a `401` there points at the key and not the URL.
+
 Check: `launch.py --check` shows `OK API keys …` or `-- API keys  no OpenRouter key yet …`.
 
 **What Semi-Local costs, and how that was worked out.** The default preset (deep `z-ai/glm-5` without reasoning,

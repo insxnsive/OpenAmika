@@ -171,13 +171,15 @@
     }));
     // where she thinks: the provider switch reflects the live selection (mixed = both panels apply)
     const kinds = new Set(ROLES.map((role) => { const item = optionList(role).find((o) => o.key === selections[role]); return item ? item.transport : "openrouter"; }));
-    const onOllama = kinds.has("ollama"), onCloud = kinds.has("openrouter") || kinds.has("alibaba") || kinds.has("native");
+    const onOllama = kinds.has("ollama"), onCustom = kinds.has("custom");
+    const onCloud = kinds.has("openrouter") || kinds.has("alibaba") || kinds.has("native");
     $("provOpenrouter").classList.toggle("active", onCloud);
     $("provOllama").classList.toggle("active", onOllama);
+    $("provCustom").classList.toggle("active", onCustom);
     $("provOpenrouter").querySelector("span").textContent = onCloud && !onOllama ? "in use · recommended · her tested models" : "recommended · her tested models · a few dollars a month";
     $("provOllama").querySelector("span").textContent = onOllama && !onCloud ? "in use · fully local · a 27B+ model" : "fully local · a 27B+ model · a 32 GB GPU or a second PC";
     $("orBackNote").hidden = !onOllama;
-    if (!provChosen) showProvider(onOllama && !onCloud ? "ollama" : "openrouter");
+    if (!provChosen) showProvider(onCustom && !onCloud && !onOllama ? "custom" : onOllama && !onCloud ? "ollama" : "openrouter");
 
     const grid = $("roleGrid");
     grid.replaceChildren();
@@ -215,11 +217,103 @@
   function showProvider(which) {
     $("orPanel").hidden = which !== "openrouter";
     $("ollamaPanel").hidden = which !== "ollama";
+    $("customPanel").hidden = which !== "custom";
     $("provOpenrouter").setAttribute("aria-pressed", String(which === "openrouter"));
     $("provOllama").setAttribute("aria-pressed", String(which === "ollama"));
+    $("provCustom").setAttribute("aria-pressed", String(which === "custom"));
   }
   $("provOpenrouter").addEventListener("click", () => { provChosen = true; showProvider("openrouter"); });
   $("provOllama").addEventListener("click", () => { provChosen = true; showProvider("ollama"); loadOllama(); });
+  $("provCustom").addEventListener("click", () => { provChosen = true; showProvider("custom"); loadCustom(); });
+
+  // ── custom OpenAI-compatible endpoint: URL, key, model rows and prices ──
+  let customLoaded = false;
+  function cuRow(model) {
+    const row = el("div", { class: "form-row", style: "margin-bottom:6px; align-items:flex-end;" });
+    const input = (label, value, placeholder, type) => {
+      const field = el("div", { class: "field" }, el("label", { text: label }));
+      field.append(el("input", { type: type || "text", value: value == null ? "" : String(value),
+                                 placeholder: placeholder || "", autocomplete: "off" }));
+      return field;
+    };
+    const api = input("Model id at the endpoint", model && model.api_model, "glm-5.3-flash");
+    const context = input("Context", model && model.context, "131072", "number");
+    const priceIn = input("$ / 1M in", model && model.prices && model.prices.input, "0", "number");
+    const priceOut = input("$ / 1M out", model && model.prices && model.prices.output, "0", "number");
+    const schema = el("label", { class: "card-hint", style: "display:flex; gap:6px; align-items:center; padding-bottom:8px;" });
+    const check = el("input", { type: "checkbox" });
+    check.checked = Boolean(model && model.json_mode === "json_schema");
+    schema.append(check, document.createTextNode("JSON schema"));
+    const remove = el("button", { class: "btn small", text: "Remove", type: "button" });
+    remove.addEventListener("click", () => row.remove());
+    row.append(api, context, priceIn, priceOut, schema, remove);
+    row._read = () => {
+      const apiModel = api.querySelector("input").value.trim();
+      if (!apiModel) return null;
+      const number = (field, fallback) => {
+        const raw = field.querySelector("input").value.trim();
+        return raw === "" ? fallback : Number(raw);
+      };
+      return { model_id: "custom/" + apiModel, api_model: apiModel,
+               context: number(context, null) || null,
+               prices: { input: number(priceIn, 0), output: number(priceOut, 0), cache_read: number(priceIn, 0) },
+               json_mode: check.checked ? "json_schema" : null };
+    };
+    return row;
+  }
+  function cuRows() { return Array.from($("cuRows").children); }
+  function cuAdd(model) { $("cuRows").append(cuRow(model)); }
+  function cuCollect() {
+    const models = [];
+    for (const row of cuRows()) {
+      const model = row._read();
+      if (model) models.push(model);
+    }
+    return models;
+  }
+  async function loadCustom() {
+    if (customLoaded) return;
+    try {
+      const info = await getJSON("/api/build_f/custom");
+      $("cuUrl").value = info.base_url || "";
+      if (info.key_hint) $("cuKey").placeholder = "saved: " + info.key_hint;
+      $("cuConfigured").hidden = !info.configured;
+      $("cuConfigured").textContent = info.configured
+        ? "This endpoint is configured with " + info.models.length + " model(s). Saving replaces them."
+        : "";
+      $("cuRows").replaceChildren();
+      for (const model of info.models || []) cuAdd(model);
+      if (!(info.models || []).length) cuAdd(null);
+      $("cuStatus").textContent = info.configured ? "saved" : "not configured yet";
+      customLoaded = true;
+    } catch (error) {
+      $("cuStatus").textContent = "status unavailable: " + (error.message || error);
+    }
+  }
+  $("cuAddRow").addEventListener("click", () => cuAdd(null));
+  $("cuTest").addEventListener("click", async () => {
+    $("cuStatus").textContent = "testing…";
+    try {
+      const r = await postAction("/api/build_f/custom/test", "custom-provider-test",
+                                 { base_url: $("cuUrl").value.trim(), key: $("cuKey").value.trim() });
+      $("cuStatus").textContent = "answered with " + r.models.length + " model(s): " + r.models.slice(0, 4).join(", ");
+    } catch (error) { $("cuStatus").textContent = String(error.message || error); }
+  });
+  $("cuSave").addEventListener("click", async () => {
+    const models = cuCollect();
+    if (!models.length) { $("cuStatus").textContent = "Add at least one model first."; return; }
+    $("cuStatus").textContent = "saving…";
+    try {
+      const r = await postAction("/api/build_f/custom", "custom-provider",
+                                 { base_url: $("cuUrl").value.trim(), key: $("cuKey").value.trim(), models });
+      $("cuStatus").textContent = r.note || "saved";
+      $("cuKey").value = "";
+      $("cuConfigured").hidden = false;
+      $("cuConfigured").textContent = "This endpoint is configured with " + r.models + " model(s). Saving replaces them.";
+      toast(r.note || "Custom endpoint saved.");
+      loadModels();
+    } catch (error) { $("cuStatus").textContent = String(error.message || error); }
+  });
   $("orBack").addEventListener("click", async () => {
     try {
       const r = await postAction("/api/build_f/preset", "apply-preset", { provider: "openrouter" });

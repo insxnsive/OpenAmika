@@ -45,11 +45,13 @@ in your city. She runs on your own PC, with OpenRouter or fully local with Ollam
 ## Which language model?
 
 Her ears, voice, memory and eyes always run on your PC. Her language model, the part that thinks and writes her
-replies, runs one of two ways:
+replies, runs one of these ways:
 
 - **Semi-Local (recommended)**: through [OpenRouter](https://openrouter.ai) on your own key. In almost all cases
   this is the better choice: she uses the models she was tested with, answers fast, and it only costs a few dollars
   a month (about $1.50 if you talk 30 turns a day, about $5 at 100 turns a day).
+- **Custom endpoint** (optional, off by default): any OpenAI-compatible URL you already pay for, such as
+  OpenCode Go, DeepSeek or a local vLLM, with your own model ids and prices. Setup → Brain → Custom endpoint.
 - **Fully Local**: on your PC with [Ollama](https://ollama.com). Use a model of **27B parameters or more**; **70B or
   more** gives the full, reliable experience. Models smaller than 27B may be really bad: she loses her character,
   forgets what you told her and breaks her reply format. A local model is also slower: all her thinking takes turns

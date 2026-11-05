@@ -36,6 +36,7 @@
     <div class="prov-switch" id="provSwitch" style="margin:12px 0;">
       <button type="button" class="prov" id="provOpenrouter" data-prov="openrouter"><b>OpenRouter</b><span>recommended · her tested models · a few dollars a month</span></button>
       <button type="button" class="prov" id="provOllama" data-prov="ollama"><b>Ollama</b><span>fully local · a 27B+ model · a 32 GB GPU or a second PC</span></button>
+      <button type="button" class="prov" id="provCustom" data-prov="custom"><b>Custom endpoint</b><span>any OpenAI-compatible URL · your key, your prices</span></button>
     </div>
     <div id="orPanel">
       <div class="form-row" style="margin-bottom:6px;">
@@ -46,6 +47,30 @@
       </div>
       <p class="card-hint" data-simple>Get a key at openrouter.ai → Keys. That's the only account OpenAmika needs, and in almost all cases the better choice: her tested models, for a few dollars a month.</p>
       <p class="card-hint" id="orBackNote" hidden>She is on Ollama right now. <button class="editorial-link" id="orBack">Switch back to the OpenRouter preset →</button></p>
+    </div>
+    <div id="customPanel" hidden>
+      <div class="form-row" style="margin-bottom:6px;">
+        <div class="field" style="flex:2"><label>Base URL (ends in /v1)</label>
+          <input type="text" id="cuUrl" placeholder="https://opencode.ai/zen/v1" autocomplete="off"></div>
+        <div class="field" style="flex:2"><label>API key</label>
+          <input type="password" id="cuKey" placeholder="your key" autocomplete="off"></div>
+      </div>
+      <p class="card-hint" style="margin-bottom:8px;">
+        <b>Your key and every message go to this URL.</b> Nothing is discovered here: enter the model ids and the
+        prices you pay, in USD per 1M tokens. Zero is fine for a local server or a subscription plan.
+      </p>
+      <div id="cuRows"></div>
+      <div class="form-row" style="margin:8px 0; align-items:center;">
+        <button class="btn small" id="cuAddRow">Add model</button>
+        <button class="btn small" id="cuTest">Test connection</button>
+        <button class="btn small primary" id="cuSave">Save</button>
+        <span class="card-hint" id="cuStatus"></span>
+      </div>
+      <p class="card-hint">
+        Tick <b>JSON schema</b> for a model that should also write her memory; without it that role leaves the model out.
+        New models show up in the role lists after she restarts.
+      </p>
+      <p class="card-hint" id="cuConfigured" hidden></p>
     </div>
     <div id="ollamaPanel" hidden>
       <div class="form-row" style="margin-bottom:8px;">

@@ -438,6 +438,103 @@ def install_persona(g):
         except ValueError as error:
             return jsonify({"ok": False, "error": str(error)}), 400
 
+    CUSTOM_CATALOG = BRAIN_DIR.parent / "config" / "custom_models.json"
+    ROLE_DOCUMENT = BRAIN_DIR.parent / "config" / "llm_roles.json"
+
+    def _custom_catalog():
+        from f_openrouter import load_custom_catalog
+        if not CUSTOM_CATALOG.is_file():
+            return None
+        return load_custom_catalog(CUSTOM_CATALOG)
+
+    def _custom_key_hint():
+        env_path = BRAIN_DIR / ".env"
+        if not env_path.is_file():
+            return None
+        for line in env_path.read_text(encoding="utf-8-sig").splitlines():
+            if line.strip().startswith("CUSTOM_OPENAI_API_KEY="):
+                key = line.split("=", 1)[1].strip().strip('"').strip("'")
+                return (key[:9] + "…" + key[-4:]) if len(key) > 16 else "saved"
+        return None
+
+    @app.route("/api/build_f/custom", methods=["GET"])
+    def custom_provider_get():
+        try:
+            catalog = _custom_catalog()
+        except ValueError as error:
+            return jsonify({"ok": False, "error": str(error)}), 400
+        models = []
+        if catalog:
+            for model_id, row in catalog["models"].items():
+                models.append({"model_id": model_id, "api_model": row["api_model"], "context": row.get("context"),
+                               "prices": row["prices"], "json_mode": row.get("json_mode")})
+        return jsonify({"ok": True, "configured": bool(catalog),
+                        "base_url": catalog["base"] if catalog else "", "models": models,
+                        "key_hint": _custom_key_hint()})
+
+    @app.route("/api/build_f/custom", methods=["POST"])
+    def custom_provider_set():
+        try:
+            from f_openrouter import load_custom_catalog
+            from f_roles import sync_custom_rows
+            value = action_request("custom-provider")
+            payload = {"version": 1, "provider": "custom",
+                       "endpoint": {"base_url": str(value.get("base_url") or "")},
+                       "models": value.get("models")}
+            # Validate through the transport before anything reaches disk.
+            probe = Path(BRAIN_DIR.parent) / "config" / ".custom_models.probe.json"
+            _write_atomic(probe, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+            try:
+                catalog = load_custom_catalog(probe)
+            finally:
+                probe.unlink(missing_ok=True)
+            key = str(value.get("key") or "").strip()
+            note = "Saved. New models appear in the role lists after she restarts."
+            if key:
+                env_path = BRAIN_DIR / ".env"
+                lines = env_path.read_text(encoding="utf-8-sig").splitlines() if env_path.is_file() else []
+                replaced = False
+                for i, line in enumerate(lines):
+                    if line.strip().startswith("CUSTOM_OPENAI_API_KEY="):
+                        lines[i] = "CUSTOM_OPENAI_API_KEY=" + key
+                        replaced = True
+                        break
+                if not replaced:
+                    lines.append("CUSTOM_OPENAI_API_KEY=" + key)
+                _write_atomic(env_path, "\n".join(lines) + "\n")
+                os.environ["CUSTOM_OPENAI_API_KEY"] = key    # the transport reads it per call
+                note = "Saved. The key takes effect on her next reply; new models need a restart."
+            document = json.loads(po_contract.read_text_bom(ROLE_DOCUMENT))
+            document = sync_custom_rows(document, catalog)
+            _write_atomic(ROLE_DOCUMENT, json.dumps(document, ensure_ascii=False, indent=2) + "\n")
+            _write_atomic(CUSTOM_CATALOG, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+            return jsonify({"ok": True, "configured": True, "base_url": catalog["base"],
+                            "models": len(catalog["models"]), "note": note})
+        except PermissionError as error:
+            return jsonify({"ok": False, "error": str(error)}), 403
+        except ValueError as error:
+            return jsonify({"ok": False, "error": str(error)}), 400
+
+    @app.route("/api/build_f/custom/test", methods=["POST"])
+    def custom_provider_test():
+        try:
+            from f_openrouter import custom_base_url, fetch_custom_models
+            value = action_request("custom-provider-test")
+            base = custom_base_url(value.get("base_url"))
+            key = str(value.get("key") or "").strip()
+            if not key:
+                key = (os.environ.get("CUSTOM_OPENAI_API_KEY") or "")
+            if not key:
+                raise ValueError("Enter the key first; the test call needs it.")
+            models = fetch_custom_models(g["http_requests"], key, base)
+            return jsonify({"ok": True, "base_url": base, "models": models})
+        except PermissionError as error:
+            return jsonify({"ok": False, "error": str(error)}), 403
+        except ValueError as error:
+            return jsonify({"ok": False, "error": str(error)}), 400
+        except Exception as error:
+            return jsonify({"ok": False, "error": "The endpoint did not answer: " + type(error).__name__}), 502
+
     @app.route("/api/build_f/reset", methods=["POST"])
     def persona_reset_all():
         """Reset everything: her memory (the confirmed wipe, backup kept), the four persona files back to the
