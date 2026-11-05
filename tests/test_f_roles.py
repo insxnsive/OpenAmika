@@ -176,6 +176,33 @@ class RoleTests(unittest.TestCase):
 if __name__=='__main__':
     unittest.main()
 
+class FakeSSE:
+    """A streamed response the client can read frame by frame."""
+
+    def __init__(self, frames):
+        self.frames, self.encoding, self.closed = frames, 'utf-8', False
+
+    def raise_for_status(self):
+        pass
+
+    def iter_lines(self, decode_unicode=True):
+        for frame in self.frames:
+            yield 'data: ' + (frame if isinstance(frame, str) else json.dumps(frame))
+            yield ''
+
+    def close(self):
+        self.closed = True
+
+
+class FakeSSEHTTP:
+    def __init__(self, frames):
+        self.response, self.posts = FakeSSE(frames), []
+
+    def post(self, url, **kwargs):
+        self.posts.append((url, kwargs))
+        return self.response
+
+
 class CustomReloadTests(unittest.TestCase):
     """reload_custom swaps the custom rows without a restart, and refuses without half-applying."""
 
@@ -428,6 +455,45 @@ class CustomReloadTests(unittest.TestCase):
             self.assertEqual(saved['endpoint']['base_url'], base_before)
             seen['runtime'] = self.manager.custom_runtime()  # the guard is released; the old pair is live
             self.assertEqual(seen['runtime'], {'base': base_before, 'key': 'old-key'})
+
+    def _stream_once(self, usage):
+        """Drive the real pick_stream -> client -> before/after hooks, not a copy of them."""
+        self._publish('custom/first')
+        frames = [{'id': 'gen-1', 'model': 'first', 'choices': [{'delta': {'content': 'reply: hello'}}]},
+                  {'id': 'gen-1', 'model': 'first', 'choices': [], 'usage': usage},
+                  '[DONE]']
+        self.g['http_requests'] = FakeSSEHTTP(frames)
+        # The registration the app hands the dispatcher: provider plus the role config, exactly like
+        # an AVAILABLE_MODELS entry. pick() then routes to the custom transport.
+        config = dict(self.g['AVAILABLE_MODELS']['surface:custom/first'])
+        with mock.patch.dict(os.environ, {'CUSTOM_OPENAI_API_KEY': 'key-1'}):
+            return ''.join(self.g['_pick_stream']({'user_content': 'Hello', '_f_phase': 'surface'}, config))
+
+    def test_a_streamed_reply_settles_through_the_production_hooks(self):
+        text = self._stream_once({'prompt_tokens': 1000, 'completion_tokens': 100,
+                                  'prompt_tokens_details': {'cached_tokens': 0}})
+        self.assertEqual(text, 'reply: hello')
+        summary = self.meter.summary()
+        self.assertEqual(summary['total_requests'], 1)
+        self.assertAlmostEqual(summary['priced_known_usd'], 0.0012)
+        self.assertEqual(summary['active_requests'], 0)
+
+    def test_a_reported_cost_in_the_usage_frame_cannot_decide_the_charge(self):
+        self._stream_once({'prompt_tokens': 1000, 'completion_tokens': 100,
+                           'prompt_tokens_details': {'cached_tokens': 0}, 'cost': 9.5})
+        summary = self.meter.summary()
+        self.assertAlmostEqual(summary['priced_known_usd'], 0.0012)
+        self.assertAlmostEqual(summary['provider_reported_usd'], 0.0)
+
+    def test_a_reply_without_usage_leaves_the_call_unconfirmed(self):
+        from f_openrouter import OpenRouterError
+        with self.assertRaises(OpenRouterError):
+            self._stream_once({})
+        summary = self.meter.summary()
+        self.assertEqual(summary['priced_known_usd'], 0.0)   # nothing was written off as free
+        self.assertEqual(summary['unconfirmed_cost_requests'], 1)
+        # The reservation is still held against the budget: only the settled amount is returned.
+        self.assertLess(summary['budget']['remaining_usd'], 1.0)
 
     def test_a_save_refuses_while_memory_work_holds_its_lock(self):
         self._publish('custom/first')
