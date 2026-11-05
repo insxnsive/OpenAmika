@@ -160,13 +160,14 @@
       else add("ok", "Memory", (memory.events != null ? memory.events + " conversations" : "ready"));
     } catch (error) { add("err", "Brain", "not answering — is the brain running? (launch.py)"); }
     // her brain's provider per role: a cloud role needs the OpenRouter key; a local role needs Ollama up
-    let usesCloud = true, usesOllama = false, localModels = [];
+    let usesCloud = true, usesOllama = false, usesCustom = false, localModels = [];
     try {
       const m = await getJSON("/api/build_f/models");
       const roles = ["surface", "deep", "reflection", "memory_write"];
       const kinds = roles.map((role) => { const item = ((m.options || {})[role] || []).find((o) => o.key === (m.selections || {})[role]); return item ? item.transport : "openrouter"; });
       usesCloud = kinds.includes("openrouter");
       usesOllama = kinds.includes("ollama");
+      usesCustom = kinds.includes("custom");
       localModels = roles.filter((_, i) => kinds[i] === "ollama").map((role) => { const item = (m.options[role] || []).find((o) => o.key === m.selections[role]); return item ? item.model : ""; });
     } catch (_) {}
     if (usesCloud) {
@@ -184,6 +185,16 @@
         else if (missing.length) add("warn", "Ollama (local brain)", "model(s) no longer detected: " + missing.join(", ") + " — Setup → Brain → Detect");
         else add("ok", "Ollama (local brain)", (o.live_version ? "v" + o.live_version + " · " : "") + Array.from(new Set(localModels)).join(", "));
       } catch (_) { add("err", "Ollama (local brain)", "status unavailable"); }
+    }
+    if (usesCustom) {
+      // A custom endpoint is ready only when it has both a catalog and a key; the transport raises on
+      // the first reply otherwise, which reads to the person as "she is broken".
+      try {
+        const c = await getJSON("/api/build_f/custom");
+        if (!c.configured) add("err", "Custom endpoint", "no endpoint saved — Setup → Brain → Custom endpoint");
+        else if (!c.key_present) add("err", "Custom endpoint", c.base_url + " has no key saved — Setup → Brain → Custom endpoint");
+        else add("ok", "Custom endpoint", c.base_url);
+      } catch (_) { add("err", "Custom endpoint", "status unavailable"); }
     }
     // speech / STT
     try {

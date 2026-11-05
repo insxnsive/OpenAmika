@@ -509,32 +509,38 @@ def install_persona(g):
                     reason = str(error) if isinstance(error, ValueError) else type(error).__name__
                     warning = (" It did not answer yet (" + reason +
                                "), so check the URL and the key with Test connection.")
-            # Commit the two documents together, or put both back. A new catalog with the old rows,
-            # or the reverse, is a configuration the manager refuses at the next start.
+            # Catalog, role document and key are one unit: publish them together under the manager's
+            # lock, and put every one of them back if any step fails. A half-applied save would let a
+            # reply carry one endpoint's key to another endpoint.
+            manager = g.get("F_ROLES")
+            manager_lock = getattr(manager, "lock", None)
+            env_path = BRAIN_DIR / ".env"
             previous_catalog = CUSTOM_CATALOG.read_text(encoding="utf-8") if CUSTOM_CATALOG.is_file() else None
             previous_roles = ROLE_DOCUMENT.read_text(encoding="utf-8") if ROLE_DOCUMENT.is_file() else None
+            previous_env_file = env_path.read_text(encoding="utf-8") if env_path.is_file() else None
             document = sync_custom_rows(json.loads(po_contract.read_text_bom(ROLE_DOCUMENT)), catalog)
+            if manager_lock is not None:
+                manager_lock.acquire()
+            wrote = False
             try:
-                _write_atomic(CUSTOM_CATALOG, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-                _write_atomic(ROLE_DOCUMENT, json.dumps(document, ensure_ascii=False, indent=2) + "\n")
-                manager = g.get("F_ROLES")
+                # Rechecked here, after the probe's network wait: a reply or a metered call can start
+                # while the endpoint is being asked, and swapping the endpoint under it is not safe.
+                if g.get("_ws_active") or g.get("_thinking_inflight"):
+                    raise ValueError("Wait for the current reply to finish, then save again.")
                 if manager is not None:
-                    manager.reload_custom()
-            except Exception:
-                if previous_catalog is None:
-                    CUSTOM_CATALOG.unlink(missing_ok=True)
-                else:
-                    _write_atomic(CUSTOM_CATALOG, previous_catalog)
-                if previous_roles is not None:
-                    _write_atomic(ROLE_DOCUMENT, previous_roles)
-                raise
-            note = "Saved. New models are in the role lists now."
-            if key:
-                # Publish the key only once the catalog it belongs to is live, so a reply can never
-                # carry the new key to the previous endpoint. The file first, memory last.
-                env_path = BRAIN_DIR / ".env"
-                try:
-                    lines = env_path.read_text(encoding="utf-8-sig").splitlines() if env_path.is_file() else []
+                    try:
+                        running = manager.meter.summary().get("active_requests") or 0
+                    except Exception:  # noqa: BLE001 - a meter read must never block a save
+                        running = 0
+                    if running:
+                        raise ValueError("Wait for the running model call to finish, then save again.")
+                _write_atomic(CUSTOM_CATALOG, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+                wrote = True
+                _write_atomic(ROLE_DOCUMENT, json.dumps(document, ensure_ascii=False, indent=2) + "\n")
+                if key:
+                    # The key file goes down before anything is published, so a failed write is a
+                    # failed save instead of a successful one with a stale key.
+                    lines = (previous_env_file or "").splitlines()
                     for index, line in enumerate(lines):
                         if line.strip().startswith("CUSTOM_OPENAI_API_KEY="):
                             lines[index] = "CUSTOM_OPENAI_API_KEY=" + key
@@ -542,12 +548,34 @@ def install_persona(g):
                     else:
                         lines.append("CUSTOM_OPENAI_API_KEY=" + key)
                     _write_atomic(env_path, "\n".join(lines) + "\n")
-                except OSError as error:
-                    warning += (" The key could not be written (" + type(error).__name__ +
-                                "), so she keeps the previous one.")
-                else:
-                    os.environ["CUSTOM_OPENAI_API_KEY"] = key
-                    note = "Saved. The key takes effect on her next reply."
+                if manager is not None:
+                    manager.reload_custom()
+            except Exception as error:
+                if not wrote:
+                    raise
+                # Best effort: a rollback that cannot write (a read-only file, a full disk) must not
+                # hide the error that caused it, and a failed write leaves the original in place.
+                for target, content in ((CUSTOM_CATALOG, previous_catalog), (ROLE_DOCUMENT, previous_roles),
+                                        (env_path, previous_env_file if key else None)):
+                    try:
+                        if content is None:
+                            target.unlink(missing_ok=True)
+                        else:
+                            _write_atomic(target, content)
+                    except OSError:
+                        pass
+                if isinstance(error, OSError):
+                    # A disk error is not the page's permission check; say what actually failed.
+                    raise ValueError("Could not write the configuration: " + str(error)) from error
+                raise
+            finally:
+                if manager_lock is not None:
+                    manager_lock.release()
+            # Published last: memory cannot fail, and the catalog it belongs to is already live.
+            note = "Saved. New models are in the role lists now."
+            if key:
+                os.environ["CUSTOM_OPENAI_API_KEY"] = key
+                note = "Saved. The key takes effect on her next reply."
             note += warning
             return jsonify({"ok": True, "configured": True, "base_url": catalog["base"],
                             "models": len(catalog["models"]), "note": note,

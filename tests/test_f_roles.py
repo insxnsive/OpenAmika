@@ -172,3 +172,94 @@ class RoleTests(unittest.TestCase):
 
 if __name__=='__main__':
     unittest.main()
+
+class CustomReloadTests(unittest.TestCase):
+    """reload_custom swaps the custom rows without a restart, and refuses without half-applying."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / 'config').mkdir()
+        shutil.copyfile(ROOT / 'config/openrouter_models.json', self.root / 'config/openrouter_models.json')
+        self.document = {'version': 1, 'options': {}, 'selections': {}}
+        for role in ROLES:
+            self.document['options'][role] = [
+                {'key': 'native:' + NATIVE_KEYS[role], 'native_key': NATIVE_KEYS[role], 'name': 'Native'},
+                {'key': 'or:' + role, 'model_id': 'deepseek/deepseek-v4-flash-0731', 'name': 'Reviewed ' + role}]
+            self.document['selections'][role] = 'or:' + role
+        self._save_document()
+        self.memory = MemoryRuntime(self.root / 'memory_f/live', lambda events, chunk: {'native': True},
+                                    lambda texts, task: [[1.] + [0.] * 767 for t in texts])
+        self.meter = UsageMeter(self.root / 'memory_f/usage.sqlite', {'models': {}}, budget_usd=1)
+        self.local = threading.local()
+
+        @contextlib.contextmanager
+        def scope(phase, turn_id='', **kwargs):
+            yield
+        self.g = {'AVAILABLE_MODELS': {key: {'name': key, 'provider': 'native', 'model': key}
+                                       for key in NATIVE_KEYS.values()},
+                  '_ws_active_lock': threading.RLock(), '_ws_active': {}, '_thinking_inflight': 0,
+                  'http_requests': HTTP(), 'OPENROUTER_KEY': 'fake-key',
+                  '_pick_stream': lambda p, c, **kw: iter(['native']),
+                  '_openai_messages': lambda p, **kw: [{'role': 'system', 'content': p.get('system', '')},
+                                                       {'role': 'user', 'content': p['user_content']}],
+                  '_extract_surface_fields': lambda raw: {'mode': 'think' if 'mode: think' in raw else 'say',
+                                                          'status': 'ok'},
+                  'parse_surface_response': lambda raw: [{'speech': raw.split('reply: ')[-1]}],
+                  'parse_response': lambda raw: [{'speech': 'hello' if 'hello' in raw else ''}]}
+        self.manager = install_roles(self.g, self.root, self.memory, self.meter, scope, self.local, {})
+
+    def tearDown(self):
+        self.memory.close()
+        self.tmp.cleanup()
+
+    def _save_document(self):
+        (self.root / 'config/llm_roles.json').write_text(json.dumps(self.document), encoding='utf-8')
+
+    def _catalog(self, model):
+        return {'base': 'https://api.example.test/v1',
+                'models': {model: {'model_id': model, 'api_model': model.split('/')[1], 'context': None,
+                                   'prices': {'input': 1.0, 'output': 2.0}, 'json_mode': 'json_schema'}}}
+
+    def _publish(self, model):
+        """Write the catalog and a role document naming it, the way a save does, then reload."""
+        from f_roles import sync_custom_rows
+        catalog = self._catalog(model)
+        payload = {'version': 1, 'provider': 'custom',
+                   'endpoint': {'base_url': catalog['base']},
+                   'models': [dict(row, prices=row['prices']) for row in catalog['models'].values()]}
+        (self.root / 'config/custom_models.json').write_text(json.dumps(payload), encoding='utf-8')
+        self.document = sync_custom_rows(self.document, catalog)
+        self._save_document()
+        return self.manager.reload_custom()
+
+    def _custom_keys(self):
+        return sorted(key for role in ROLES for key, item in self.manager.options[role].items()
+                      if item.get('transport') == 'custom')
+
+    def test_a_save_is_visible_without_a_restart(self):
+        self.assertEqual(self._custom_keys(), [])
+        self._publish('custom/first')
+        self.assertEqual(self._custom_keys(), ['deep:custom/first', 'memory_write:custom/first',
+                                               'reflection:custom/first', 'surface:custom/first'])
+        self.assertIn('custom/first', self.manager.custom['models'])
+
+    def test_a_second_save_replaces_the_first(self):
+        self._publish('custom/first')
+        self._publish('custom/second')
+        self.assertEqual(self._custom_keys(), ['deep:custom/second', 'memory_write:custom/second',
+                                               'reflection:custom/second', 'surface:custom/second'])
+
+    def test_a_catalog_the_manager_refuses_leaves_the_running_state_alone(self):
+        self._publish('custom/first')
+        before = self._custom_keys()
+        before_base = self.manager.custom['base']
+        # A row with no prices: the loader refuses it, so the reload must put everything back.
+        payload = {'version': 1, 'provider': 'custom', 'endpoint': {'base_url': 'https://other.example.test/v1'},
+                   'models': [{'model_id': 'custom/third', 'api_model': 'third'}]}
+        (self.root / 'config/custom_models.json').write_text(json.dumps(payload), encoding='utf-8')
+        with self.assertRaises(ValueError):
+            self.manager.reload_custom()
+        self.assertEqual(self._custom_keys(), before)
+        self.assertEqual(self.manager.custom['base'], before_base)
+

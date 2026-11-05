@@ -225,7 +225,7 @@
   }
   $("provOpenrouter").addEventListener("click", () => { provChosen = true; showProvider("openrouter"); });
   $("provOllama").addEventListener("click", () => { provChosen = true; showProvider("ollama"); loadOllama(); });
-  $("provCustom").addEventListener("click", () => { provChosen = true; showProvider("custom"); loadCustom(); });
+  $("provCustom").addEventListener("click", () => { provChosen = true; showProvider("custom"); });
 
   // ── custom OpenAI-compatible endpoint: URL, key, model rows and prices ──
   let customLoaded = false;
@@ -276,15 +276,22 @@
   function cuRows() { return Array.from($("cuRows").children); }
   function cuAdd(model) { $("cuRows").append(cuRow(model)); }
   function cuCollect() {
+    // A row that fails its own check blocks the whole save: sending the remaining rows would replace
+    // the catalog without the model that row described.
     const models = [];
+    let invalid = "";
     for (const row of cuRows()) {
       const model = row._read();
       if (model) models.push(model);
+      else if (row._invalid && !invalid) invalid = row._invalid;
     }
-    return models;
+    return { models, invalid };
   }
+  let customLoading = null;
   async function loadCustom() {
     if (customLoaded) return;
+    if (customLoading) return customLoading;   // a second click joins the call already running
+    customLoading = (async () => {
     try {
       const info = await getJSON("/api/build_f/custom");
       $("cuUrl").value = info.base_url || "";
@@ -303,7 +310,9 @@
       customLoaded = true;
     } catch (error) {
       $("cuStatus").textContent = "status unavailable: " + (error.message || error);
-    }
+    } finally { customLoading = null; }
+    })();
+    return customLoading;
   }
   $("cuAddRow").addEventListener("click", () => cuAdd(null));
   $("cuTest").addEventListener("click", async () => {
@@ -316,10 +325,10 @@
     } catch (error) { $("cuStatus").textContent = String(error.message || error); }
   });
   $("cuSave").addEventListener("click", async () => {
-    const models = cuCollect();
+    const { models, invalid } = cuCollect();
+    if (invalid) { $("cuStatus").textContent = invalid; return; }
     if (!models.length) {
-      const invalid = cuRows().map((row) => row._invalid).find(Boolean);
-      $("cuStatus").textContent = invalid || "Add at least one model first.";
+      $("cuStatus").textContent = "Add at least one model first.";
       return;
     }
     $("cuStatus").textContent = "saving…";
