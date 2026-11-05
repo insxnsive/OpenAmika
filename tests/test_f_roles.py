@@ -1,6 +1,7 @@
 import contextlib
 import copy
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -249,6 +250,31 @@ class CustomReloadTests(unittest.TestCase):
         self._publish('custom/second')
         self.assertEqual(self._custom_keys(), ['deep:custom/second', 'memory_write:custom/second',
                                                'reflection:custom/second', 'surface:custom/second'])
+
+    def test_the_endpoint_and_key_are_read_as_one_pair(self):
+        self._publish('custom/first')
+        os.environ['CUSTOM_OPENAI_API_KEY'] = 'key-one'
+        try:
+            runtime = self.manager.custom_runtime()
+            self.assertEqual(runtime, {'base': 'https://api.example.test/v1', 'key': 'key-one'})
+            with self.assertRaises(RuntimeError):
+                os.environ.pop('CUSTOM_OPENAI_API_KEY')
+                self.manager.custom_runtime()
+        finally:
+            os.environ.pop('CUSTOM_OPENAI_API_KEY', None)
+
+    def test_a_refused_reload_leaves_no_meter_rates_behind(self):
+        self._publish('custom/first')
+        rates_before = dict(self.meter.pricing['models'])
+        # A row for a model the catalog does not carry: the first role's rows and their rates are built
+        # before this one fails, so a rollback that forgets the meter leaves them installed.
+        self.document['options']['surface'].append(
+            {'key': 'surface:custom/missing', 'provider': 'custom', 'model_id': 'custom/missing', 'name': 'Missing'})
+        self._save_document()
+        with self.assertRaises(ValueError):
+            self.manager.reload_custom()
+        self.assertEqual(dict(self.meter.pricing['models']), rates_before)
+        self.assertNotIn('surface:custom/missing', self.manager.options['surface'])
 
     def test_a_catalog_the_manager_refuses_leaves_the_running_state_alone(self):
         self._publish('custom/first')

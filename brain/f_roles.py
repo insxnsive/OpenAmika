@@ -284,6 +284,8 @@ class RoleManager:
                 "selections": copy.deepcopy(self.selections),
                 "selection_fallback": dict(self.selection_fallback),
                 "available": dict(self.g.get("AVAILABLE_MODELS") or {}),
+                # _add_price writes into the meter's own map, not into self.pricing.
+                "meter_rates": dict((self.meter.pricing or {}).get("models") or {}),
             }
             previous = [(role, key, item) for role in ROLES
                         for key, item in self.options[role].items() if item.get("transport") == CUSTOM]
@@ -337,6 +339,10 @@ class RoleManager:
                 self._registrations.update(snapshot["registrations"])
                 self.pricing.clear()
                 self.pricing.update(snapshot["pricing"])
+                meter_models = (self.meter.pricing or {}).get("models")
+                if isinstance(meter_models, dict):
+                    meter_models.clear()
+                    meter_models.update(snapshot["meter_rates"])
                 self.selections = snapshot["selections"]
                 self.selection_fallback = snapshot["selection_fallback"]
                 available = self.g.get("AVAILABLE_MODELS")
@@ -348,6 +354,24 @@ class RoleManager:
                             available.pop(key, None)
                 raise
             return self.get()
+
+    def custom_runtime(self):
+        """The live endpoint and the key that goes with it, read together under the manager lock.
+
+        A caller that read the catalog and the key separately could be paused in between and come back
+        with one save's endpoint and another's key. Everything that builds a custom client reads the
+        pair here instead.
+        """
+        with self.lock:
+            if self.custom is None:
+                path = self.root / "config" / "custom_models.json"
+                if not path.is_file():
+                    raise RuntimeError("Custom endpoint needs config/custom_models.json")
+                self.custom = load_custom_catalog(path)
+            key = os.environ.get("CUSTOM_OPENAI_API_KEY") or ""
+            if not key:
+                raise RuntimeError("Custom endpoint key unavailable (CUSTOM_OPENAI_API_KEY)")
+            return {"base": self.custom["base"], "key": key}
 
     def _config(self, role, transport, row):
         if transport == OLLAMA:
@@ -628,12 +652,8 @@ def install_roles(g, root, memory, meter, scope, local, pricing):
                     raise RuntimeError("DASHSCOPE_BASE_URL differs from the reviewed Alibaba endpoint")
             return AlibabaClient(g["http_requests"], key, before, after, base_url=base, event_sink=event_sink)
         if config is not None and config.get("transport") == CUSTOM:
-            key = g.get("CUSTOM_OPENAI_KEY") or os.getenv("CUSTOM_OPENAI_API_KEY")
-            if not key:
-                raise RuntimeError("Custom endpoint key unavailable (CUSTOM_OPENAI_API_KEY)")
-            if manager.custom is None:
-                raise RuntimeError("Custom endpoint needs config/custom_models.json")
-            return CustomClient(g["http_requests"], key, before, after, base_url=manager.custom["base"],
+            runtime = manager.custom_runtime()      # endpoint and key captured together, under its lock
+            return CustomClient(g["http_requests"], runtime["key"], before, after, base_url=runtime["base"],
                                 event_sink=event_sink)
         key = g.get("OPENROUTER_KEY") or os.getenv("OPENROUTER_API_KEY")
         return OpenRouterClient(g["http_requests"], key, before, after, event_sink=event_sink)

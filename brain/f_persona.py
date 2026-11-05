@@ -509,19 +509,17 @@ def install_persona(g):
                     reason = str(error) if isinstance(error, ValueError) else type(error).__name__
                     warning = (" It did not answer yet (" + reason +
                                "), so check the URL and the key with Test connection.")
-            # Catalog, role document and key are one unit: publish them together under the manager's
-            # lock, and put every one of them back if any step fails. A half-applied save would let a
-            # reply carry one endpoint's key to another endpoint.
+            # Catalog, role document, key and the live reload are one unit under the manager's lock.
+            # Snapshots are read inside the lock too: a selection that committed while the endpoint was
+            # being probed must not be rolled back to the older document by a failed save.
             manager = g.get("F_ROLES")
             manager_lock = getattr(manager, "lock", None)
             env_path = BRAIN_DIR / ".env"
-            previous_catalog = CUSTOM_CATALOG.read_text(encoding="utf-8") if CUSTOM_CATALOG.is_file() else None
-            previous_roles = ROLE_DOCUMENT.read_text(encoding="utf-8") if ROLE_DOCUMENT.is_file() else None
-            previous_env_file = env_path.read_text(encoding="utf-8") if env_path.is_file() else None
-            document = sync_custom_rows(json.loads(po_contract.read_text_bom(ROLE_DOCUMENT)), catalog)
             if manager_lock is not None:
                 manager_lock.acquire()
             wrote = False
+            key_written = False
+            previous_env_value = os.environ.get("CUSTOM_OPENAI_API_KEY")
             try:
                 # Rechecked here, after the probe's network wait: a reply or a metered call can start
                 # while the endpoint is being asked, and swapping the endpoint under it is not safe.
@@ -530,10 +528,15 @@ def install_persona(g):
                 if manager is not None:
                     try:
                         running = manager.meter.summary().get("active_requests") or 0
-                    except Exception:  # noqa: BLE001 - a meter read must never block a save
-                        running = 0
+                    except Exception:  # noqa: BLE001
+                        # Fail closed: if idleness cannot be proven, do not swap the endpoint.
+                        raise ValueError("Could not confirm she is idle; try again in a moment.") from None
                     if running:
                         raise ValueError("Wait for the running model call to finish, then save again.")
+                previous_catalog = CUSTOM_CATALOG.read_text(encoding="utf-8") if CUSTOM_CATALOG.is_file() else None
+                previous_roles = ROLE_DOCUMENT.read_text(encoding="utf-8") if ROLE_DOCUMENT.is_file() else None
+                previous_env_file = env_path.read_text(encoding="utf-8") if env_path.is_file() else None
+                document = sync_custom_rows(json.loads(po_contract.read_text_bom(ROLE_DOCUMENT)), catalog)
                 _write_atomic(CUSTOM_CATALOG, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
                 wrote = True
                 _write_atomic(ROLE_DOCUMENT, json.dumps(document, ensure_ascii=False, indent=2) + "\n")
@@ -548,22 +551,38 @@ def install_persona(g):
                     else:
                         lines.append("CUSTOM_OPENAI_API_KEY=" + key)
                     _write_atomic(env_path, "\n".join(lines) + "\n")
+                key_written = bool(key)
                 if manager is not None:
                     manager.reload_custom()
+                if key:
+                    # Published while the lock is still held, so a client cannot pair a new endpoint
+                    # with the previous key: custom_runtime() reads both under this same lock.
+                    os.environ["CUSTOM_OPENAI_API_KEY"] = key
             except Exception as error:
                 if not wrote:
                     raise
-                # Best effort: a rollback that cannot write (a read-only file, a full disk) must not
-                # hide the error that caused it, and a failed write leaves the original in place.
-                for target, content in ((CUSTOM_CATALOG, previous_catalog), (ROLE_DOCUMENT, previous_roles),
-                                        (env_path, previous_env_file if key else None)):
+                if key_written:
+                    if previous_env_value is None:
+                        os.environ.pop("CUSTOM_OPENAI_API_KEY", None)
+                    else:
+                        os.environ["CUSTOM_OPENAI_API_KEY"] = previous_env_value
+                # Restoring is best effort for the disk, but a restore that fails means the install is
+                # no longer provably coherent: say so instead of reporting a normal failure.
+                restore_failures = []
+                entries = [(CUSTOM_CATALOG, previous_catalog), (ROLE_DOCUMENT, previous_roles)]
+                if key_written:
+                    entries.append((env_path, previous_env_file))
+                for target, content in entries:
                     try:
                         if content is None:
                             target.unlink(missing_ok=True)
                         else:
                             _write_atomic(target, content)
-                    except OSError:
-                        pass
+                    except OSError as restore_error:
+                        restore_failures.append(target.name + ": " + str(restore_error))
+                if restore_failures:
+                    raise ValueError("The save failed and part of it could not be undone (" +
+                                     "; ".join(restore_failures) + "). Check the Setup page and restart her.") from error
                 if isinstance(error, OSError):
                     # A disk error is not the page's permission check; say what actually failed.
                     raise ValueError("Could not write the configuration: " + str(error)) from error
@@ -571,10 +590,8 @@ def install_persona(g):
             finally:
                 if manager_lock is not None:
                     manager_lock.release()
-            # Published last: memory cannot fail, and the catalog it belongs to is already live.
             note = "Saved. New models are in the role lists now."
             if key:
-                os.environ["CUSTOM_OPENAI_API_KEY"] = key
                 note = "Saved. The key takes effect on her next reply."
             note += warning
             return jsonify({"ok": True, "configured": True, "base_url": catalog["base"],
