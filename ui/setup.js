@@ -296,7 +296,8 @@
     try {
       const r = await postAction("/api/build_f/custom/test", "custom-provider-test",
                                  { base_url: $("cuUrl").value.trim(), key: $("cuKey").value.trim() });
-      $("cuStatus").textContent = "answered with " + r.models.length + " model(s): " + r.models.slice(0, 4).join(", ");
+      const listed = Array.isArray(r.models) ? r.models : [];
+      $("cuStatus").textContent = "answered with " + listed.length + " model(s): " + listed.slice(0, 4).join(", ");
     } catch (error) { $("cuStatus").textContent = String(error.message || error); }
   });
   $("cuSave").addEventListener("click", async () => {
@@ -309,7 +310,7 @@
       $("cuStatus").textContent = r.note || "saved";
       $("cuKey").value = "";
       $("cuConfigured").hidden = false;
-      $("cuConfigured").textContent = "This endpoint is configured with " + r.models + " model(s). Saving replaces them.";
+      $("cuConfigured").textContent = "This endpoint is configured with " + (r.models || models.length) + " model(s). Saving replaces them.";
       toast(r.note || "Custom endpoint saved.");
       loadModels();
     } catch (error) { $("cuStatus").textContent = String(error.message || error); }
