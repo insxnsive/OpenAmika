@@ -490,6 +490,20 @@ def install_persona(g):
                 probe.unlink(missing_ok=True)
             key = str(value.get("key") or "").strip()
             note = "Saved. New models appear in the role lists after she restarts."
+            # Reach the endpoint before anything reaches disk, so a wrong URL or key can never leave a
+            # half-written install behind. Not reaching it is not fatal: configuring ahead of a working
+            # endpoint is legitimate, so the answer just says whether it answered.
+            warning = ""
+            verified = False
+            probe_key = key or (os.environ.get("CUSTOM_OPENAI_API_KEY") or "")
+            if probe_key:
+                try:
+                    from f_openrouter import fetch_custom_models
+                    verified = bool(fetch_custom_models(g["http_requests"], probe_key, catalog["base"]))
+                except Exception as error:  # noqa: BLE001 - every transport answer is reported, none raised
+                    reason = str(error) if isinstance(error, ValueError) else type(error).__name__
+                    warning = (" It did not answer yet (" + reason +
+                               "), so check the URL and the key with Test connection.")
             if key:
                 env_path = BRAIN_DIR / ".env"
                 lines = env_path.read_text(encoding="utf-8-sig").splitlines() if env_path.is_file() else []
@@ -504,16 +518,7 @@ def install_persona(g):
                 _write_atomic(env_path, "\n".join(lines) + "\n")
                 os.environ["CUSTOM_OPENAI_API_KEY"] = key    # the transport reads it per call
                 note = "Saved. The key takes effect on her next reply; new models need a restart."
-            # A wrong URL or key can still be saved, because configuring before the endpoint is reachable is
-            # legitimate; the answer says whether it actually reached the endpoint so the page can be honest.
-            verified = False
-            if key:
-                try:
-                    from f_openrouter import fetch_custom_models
-                    verified = bool(fetch_custom_models(g["http_requests"], key, catalog["base"]))
-                except ValueError as error:
-                    note += (" It did not answer yet (" + str(error) +
-                             "), so check the URL and the key with Test connection.")
+            note += warning
             document = json.loads(po_contract.read_text_bom(ROLE_DOCUMENT))
             document = sync_custom_rows(document, catalog)
             _write_atomic(ROLE_DOCUMENT, json.dumps(document, ensure_ascii=False, indent=2) + "\n")
