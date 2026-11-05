@@ -504,12 +504,23 @@ def install_persona(g):
                 _write_atomic(env_path, "\n".join(lines) + "\n")
                 os.environ["CUSTOM_OPENAI_API_KEY"] = key    # the transport reads it per call
                 note = "Saved. The key takes effect on her next reply; new models need a restart."
+            # A wrong URL or key can still be saved, because configuring before the endpoint is reachable is
+            # legitimate; the answer says whether it actually reached the endpoint so the page can be honest.
+            verified = False
+            if key:
+                try:
+                    from f_openrouter import fetch_custom_models
+                    verified = bool(fetch_custom_models(g["http_requests"], key, catalog["base"]))
+                except ValueError as error:
+                    note += (" It did not answer yet (" + str(error) +
+                             "), so check the URL and the key with Test connection.")
             document = json.loads(po_contract.read_text_bom(ROLE_DOCUMENT))
             document = sync_custom_rows(document, catalog)
             _write_atomic(ROLE_DOCUMENT, json.dumps(document, ensure_ascii=False, indent=2) + "\n")
             _write_atomic(CUSTOM_CATALOG, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
             return jsonify({"ok": True, "configured": True, "base_url": catalog["base"],
-                            "models": len(catalog["models"]), "note": note})
+                            "models": len(catalog["models"]), "note": note,
+                            "verified": verified})
         except PermissionError as error:
             return jsonify({"ok": False, "error": str(error)}), 403
         except ValueError as error:
