@@ -11,6 +11,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'brain'))
 from f_roles import NATIVE_KEYS
+from f_usage import UsageMeter
 from f_openrouter import (CUSTOM, CustomClient, custom_base_url, custom_role_config, custom_cost, custom_price,
                           estimate_custom_reservation, fetch_custom_models, load_custom_catalog, make_custom_body,
                           normalize_custom_usage)
@@ -283,6 +284,91 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(Exception):
             fetch_custom_models(http, '', self.catalog['base'])
 
+
+class StreamSettlementTests(unittest.TestCase):
+    """The custom client's own stream path, settled through a real UsageMeter."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.catalog = load_custom_catalog(write_catalog(CATALOG))
+        self.config = custom_role_config(self.catalog, 'custom/glm-5.3-flash', 'surface')
+        self.meter = UsageMeter(self.root / 'usage.sqlite',
+                                {'models': {'custom:custom/glm-5.3-flash': {'input': 1.0, 'output': 2.0,
+                                                                            'cache_read': 0.25}}})
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def events(self, usage):
+        head = {'id': 'gen-1', 'model': 'glm-5.3-flash',
+                'choices': [{'delta': {'content': 'reply: hello'}}]}
+        tail = {'id': 'gen-1', 'model': 'glm-5.3-flash', 'choices': [], 'usage': usage}
+        return [head, tail, '[DONE]']
+
+    def run_stream(self, usage):
+        receipts, handles, settled = [], [], []
+
+        def reserve(request):
+            handle = self.meter.begin('custom', 'custom/glm-5.3-flash', 'surface',
+                                      estimated_max_usd=request['estimated_max_usd'])
+            handles.append(handle)
+            return handle
+
+        def settle(handle, receipt):
+            receipts.append(receipt)
+            self.settled = settled
+            # The bridge settles with the provider's raw usage and the transport's priced cost,
+            # so a provider-supplied cost cannot decide what a call cost.
+            settled.append(self.meter.finish(handle, receipt['raw_usage'], status=receipt['status'],
+                                             reported_cost_usd=receipt.get('cost_usd'),
+                                             actual_model=receipt.get('actual_model'), actual_provider='custom',
+                                             provider_request_id=receipt.get('request_id')))
+
+        class Response:
+            def __init__(self, frames):
+                self.frames, self.closed = frames, False
+
+            def raise_for_status(self):
+                pass
+
+            def iter_lines(self, decode_unicode=True):
+                for frame in self.frames:
+                    yield 'data: ' + (frame if isinstance(frame, str) else json.dumps(frame))
+                    yield ''
+
+            def close(self):
+                self.closed = True
+
+        http = HTTP(Response(self.events(usage)))
+        client = CustomClient(http, 'key', reserve, settle, base_url=self.catalog['base'])
+        text = ''.join(client.stream(self.config, MESSAGES))
+        return text, receipts, handles
+
+    def test_a_final_usage_frame_then_done_settles_at_the_entered_rates(self):
+        text, receipts, handles = self.run_stream({'prompt_tokens': 1000, 'completion_tokens': 100,
+                                                   'prompt_tokens_details': {'cached_tokens': 0}})
+        self.assertEqual(text, 'reply: hello')
+        receipt = receipts[0]
+        self.assertEqual(receipt['status'], 'complete')
+        self.assertAlmostEqual(receipt['cost_usd'], 0.0012)
+        row = self.settled[0]
+        self.assertEqual(row['id'], handles[0])
+        self.assertAlmostEqual(row['cost_usd'], 0.0012)
+        self.assertEqual(self.meter.summary()['total_requests'], 1)
+
+    def test_a_reported_cost_cannot_override_the_entered_rates(self):
+        _, receipts, _ = self.run_stream({'prompt_tokens': 1000, 'completion_tokens': 100,
+                                          'prompt_tokens_details': {'cached_tokens': 0}, 'cost': 9.5})
+        self.assertAlmostEqual(receipts[0]['cost_usd'], 0.0012)
+
+    def test_missing_usage_leaves_the_accounting_unknown(self):
+        # The transport refuses to call an unpriced reply complete: the receipt is still recorded, as
+        # unknown, so the reservation stays visible instead of being silently written off.
+        with self.assertRaises(Exception):
+            self.run_stream({})
+        self.assertEqual(self.settled[0]['status'], 'unknown')
+        self.assertIsNone(self.settled[0]['cost_usd'])
 
 class RoleWiringTests(unittest.TestCase):
     """The role manager must accept a custom option without touching any other transport."""
