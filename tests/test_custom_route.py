@@ -201,6 +201,42 @@ class CustomRouteTests(unittest.TestCase):
         self.assertEqual(dotenv_values(stream=__import__('io').StringIO(text))['CUSTOM_OPENAI_API_KEY'],
                          'sk-test-key')
 
+    def save_with_key(self, key='sk-test-key'):
+        self.g['http_requests'] = mock.MagicMock()
+        with mock.patch('f_openrouter.load_custom_catalog', return_value=CATALOG), \
+             mock.patch('f_openrouter.fetch_custom_models', return_value=['custom/first']):
+            return self.post(body={'base_url': BODY['base_url'], 'key': key, 'models': BODY['models']})
+
+    def read_env(self):
+        from dotenv import dotenv_values
+        from io import StringIO
+        text = (self.root / 'brain/.env').read_text(encoding='utf-8')
+        return text, dotenv_values(stream=StringIO(text))
+
+    def test_a_multiline_key_assignment_is_removed_whole(self):
+        # A quoted value spans lines, so a line filter deletes its first line and leaves an orphan
+        # quote behind that swallows the next assignment.
+        # The shape that bites: the quoted value contains a line that looks like another assignment, and
+        # an orphan quote left behind would swallow the assignment after it.
+        (self.root / 'brain/.env').write_text(
+            'OPENROUTER_API_KEY=keep-example\nCUSTOM_OPENAI_API_KEY="old\n'
+            'OPENROUTER_API_KEY=changed-example\n"\n', encoding='utf-8')
+        self.assertEqual(self.save_with_key().status_code, 200)
+        text, parsed = self.read_env()
+        self.assertEqual(parsed['OPENROUTER_API_KEY'], 'keep-example')
+        self.assertEqual(parsed['CUSTOM_OPENAI_API_KEY'], 'sk-test-key')
+        self.assertEqual(text.count('CUSTOM_OPENAI_API_KEY'), 1)
+        self.assertNotIn('old', text)
+
+    def test_an_unrelated_multiline_value_survives_the_rewrite(self):
+        multiline = 'a\nCUSTOM_OPENAI_API_KEY=not-a-key\nb'
+        (self.root / 'brain/.env').write_text(
+            'OPENROUTER_API_KEY="' + multiline + '"\n', encoding='utf-8')
+        self.assertEqual(self.save_with_key().status_code, 200)
+        _text, parsed = self.read_env()
+        self.assertEqual(parsed['OPENROUTER_API_KEY'], multiline)
+        self.assertEqual(parsed['CUSTOM_OPENAI_API_KEY'], 'sk-test-key')
+
     def test_the_page_reads_the_blocked_state(self):
         response = self.client.get('/api/build_f/custom')
         self.assertEqual(response.status_code, 200)

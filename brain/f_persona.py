@@ -127,16 +127,28 @@ KEY_NAME = "CUSTOM_OPENAI_API_KEY"
 
 
 def _env_without_key(text, name):
-    """Drop every semantic definition of the key, keeping unrelated lines untouched."""
-    kept = []
-    for line in text.splitlines():
-        head = line.strip()
-        if head.startswith("export "):
-            head = head[len("export "):].strip()
-        if head.split("=", 1)[0].strip() == name:
+    """Drop every binding of the key, keeping unrelated content exactly as it was.
+
+    Line filtering is not enough: a value may be quoted across several lines, so the assignment has to
+    be removed as one parsed node, or its continuation lines stay behind and shift the values around
+    them on the next load.
+    """
+    from dotenv.parser import parse_stream
+
+    kept = text
+    cursor = 0
+    for binding in parse_stream(io.StringIO(text)):
+        if getattr(binding, "error", False):
+            raise ValueError("brain/.env has a line that cannot be parsed, so nothing was changed.")
+        if (binding.key or "").strip() != name:
             continue
-        kept.append(line)
-    return kept
+        chunk = binding.original.string
+        index = kept.find(chunk, cursor)
+        if index == -1:  # pragma: no cover - the parser hands back the source it read
+            raise ValueError("brain/.env could not be rewritten safely, so nothing was changed.")
+        kept = kept[:index] + kept[index + len(chunk):]
+        cursor = index
+    return kept.splitlines()
 
 
 def _commit_custom_config(catalog, payload, key, manager, g, catalog_path, roles_path, env_path, marker_path,
