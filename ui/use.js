@@ -1389,6 +1389,7 @@ registerProcessor('pcm-pusher', PCMPusher);`;
         // one-click choice only once a catalog exists there, and otherwise points at the page.
         cuBtn = el("button", { type: "button", class: "prov", "aria-pressed": "false", hidden: "" },
           el("b", { text: "My endpoint" }), el("span", { text: "an OpenAI-compatible URL you already set up" }));
+        cuBtn.addEventListener("click", () => pick("custom"));
         cuPanel = el("div", { class: "body", hidden: "" });
         const cuNote = el("p", { class: "card-hint", text: "" });
         const cuUse = button("Use my endpoint", async () => {
