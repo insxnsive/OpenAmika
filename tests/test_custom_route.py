@@ -135,6 +135,36 @@ class CustomRouteTests(unittest.TestCase):
         self.assertIn('variable reference', response.get_json()['error'])
         self.assertFalse((self.root / 'config/custom_models.json').exists())
 
+    def test_a_shell_expansion_without_a_name_is_refused(self):
+        body = {'base_url': BODY['base_url'], 'key': '${1:-sk-fallback}', 'models': BODY['models']}
+        with mock.patch('f_openrouter.load_custom_catalog', return_value=CATALOG), \
+             mock.patch('f_openrouter.fetch_custom_models', return_value=['custom/first']):
+            response = self.post(body=body)
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse((self.root / 'config/custom_models.json').exists())
+
+    def test_a_quoted_key_is_refused_because_dotenv_strips_the_quotes(self):
+        body = {'base_url': BODY['base_url'], 'key': '"sk-demo"', 'models': BODY['models']}
+        with mock.patch('f_openrouter.load_custom_catalog', return_value=CATALOG), \
+             mock.patch('f_openrouter.fetch_custom_models', return_value=['custom/first']):
+            response = self.post(body=body)
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse((self.root / 'config/custom_models.json').exists())
+
+    def test_the_saved_key_reads_back_unchanged_after_a_restart(self):
+        # load_dotenv turns the stored line back into the credential a later process will use, so the
+        # round trip is what matters, not the string that went in.
+        from dotenv import dotenv_values
+        from io import StringIO
+        key = 'sk-abc123DEF456ghi789'
+        self.g['http_requests'] = mock.MagicMock()
+        with mock.patch('f_openrouter.load_custom_catalog', return_value=CATALOG), \
+             mock.patch('f_openrouter.fetch_custom_models', return_value=['custom/first']):
+            response = self.post(body={'base_url': BODY['base_url'], 'key': key, 'models': BODY['models']})
+        self.assertEqual(response.status_code, 200)
+        stored = (self.root / 'brain/.env').read_text(encoding='utf-8')
+        self.assertEqual(dotenv_values(stream=StringIO(stored))['CUSTOM_OPENAI_API_KEY'], key)
+
     def test_a_key_with_a_newline_never_reaches_the_test_call(self):
         body = {'base_url': BODY['base_url'], 'key': 'sk-bad\nsuffix'}
         with mock.patch('f_openrouter.fetch_custom_models') as fetch:

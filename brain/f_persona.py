@@ -604,10 +604,13 @@ def install_persona(g):
             return ""
         if any(character in key for character in ("\x00", "\n", "\r")):
             raise ValueError("The key contains a character that cannot be saved.")
-        if re.search(r"\$\{?[A-Za-z_][A-Za-z0-9_]*", key):
-            # load_dotenv expands this at the next start, so the endpoint would receive another
-            # provider's secret in place of the text the person pasted.
+        if "${" in key or re.search(r"\$[A-Za-z_][A-Za-z0-9_]*", key):
+            # load_dotenv expands these at the next start, so the endpoint would receive something
+            # other than the text the person pasted. ${1:-fallback} expands just as well as ${NAME}.
             raise ValueError("That looks like a variable reference. Paste the key itself, not a name in braces.")
+        if any(character in key for character in ("\"", "'", "`")):
+            # dotenv strips a surrounding quote on load, so a quoted key becomes a different string.
+            raise ValueError("The key has a quote in it. Paste the key itself.")
         if any(character.isspace() for character in key) or "#" in key:
             raise ValueError("The key has a space or a # in it. Paste the key itself.")
         return key
