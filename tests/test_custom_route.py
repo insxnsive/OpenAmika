@@ -172,3 +172,6 @@ class SpeechAllowlistTests(unittest.TestCase):
         self.assertIsNotNone(fields)
         self.assertIn('blocked', fields)
         self.assertIn('key_present', fields)
+        # the page shows whether the endpoint answered during the save, so the field has to survive
+        # the proxy
+        self.assertIn('verified', fields)

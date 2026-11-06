@@ -1317,11 +1317,14 @@ registerProcessor('pcm-pusher', PCMPusher);`;
         const olBtn = el("button", { type: "button", class: "prov", "aria-pressed": "false" }, el("b", { text: "Ollama" }), el("span", { text: "fully local · a 27B+ model · a 32 GB GPU or a second PC" }));
         choice.append(orBtn, olBtn);
         const orPanel = el("div", { class: "body" }), olPanel = el("div", { class: "body", hidden: "" });
+        // Declared here, not with the rest of the custom panel below: pick() reads them, and a
+        // caller that ran during this block would hit the temporal dead zone.
+        let cuBtn = null, cuPanel = null;
         const pick = (which) => {
           orPanel.hidden = which !== "openrouter"; olPanel.hidden = which !== "ollama";
-          cuPanel.hidden = which !== "custom";
+          if (cuPanel) cuPanel.hidden = which !== "custom";
           orBtn.setAttribute("aria-pressed", String(which === "openrouter")); olBtn.setAttribute("aria-pressed", String(which === "ollama"));
-          cuBtn.setAttribute("aria-pressed", String(which === "custom"));
+          if (cuBtn) cuBtn.setAttribute("aria-pressed", String(which === "custom"));
           if (which === "ollama") loadOllamaPanel();
         };
         orBtn.addEventListener("click", () => pick("openrouter"));
@@ -1384,9 +1387,9 @@ registerProcessor('pcm-pusher', PCMPusher);`;
           el("div", { class: "form-row" }, el("div", { class: "field", style: "flex:2" }, el("label", { text: "Model for all four roles" }), olSelect), useBtn), olNote);
         // Custom endpoint: the URL, key and per-model prices are entered in Setup, so the wizard offers a
         // one-click choice only once a catalog exists there, and otherwise points at the page.
-        const cuBtn = el("button", { type: "button", class: "prov", "aria-pressed": "false", hidden: "" },
+        cuBtn = el("button", { type: "button", class: "prov", "aria-pressed": "false", hidden: "" },
           el("b", { text: "My endpoint" }), el("span", { text: "an OpenAI-compatible URL you already set up" }));
-        const cuPanel = el("div", { class: "body", hidden: "" });
+        cuPanel = el("div", { class: "body", hidden: "" });
         const cuNote = el("p", { class: "card-hint", text: "" });
         const cuUse = button("Use my endpoint", async () => {
           cuNote.textContent = "switching…";
@@ -1410,6 +1413,16 @@ registerProcessor('pcm-pusher', PCMPusher);`;
           const transports = ["surface", "deep", "reflection", "memory_write"].map(t);
           const hasCustom = Object.values(m.options || {}).some((rows) => (rows || []).some((o) => o.transport === "custom"));
           if (hasCustom) { cuBtn.hidden = false; cuHint.hidden = true; }
+          // A preset applied to an endpoint that is blocked, or saved without a key, fails on the
+          // first reply, so the button stays off until Setup can vouch for it.
+          getJSON("/api/build_f/custom").then((info) => {
+            const ready = info && info.configured && info.key_present && !info.blocked;
+            cuUse.disabled = !ready;
+            cuUse.title = ready ? ""
+              : info && info.blocked ? "This endpoint is blocked until a save succeeds: " + info.blocked
+              : "Set the endpoint and its key up in Setup first.";
+            cuNote.textContent = ready ? "" : cuUse.title;
+          }).catch(() => { cuUse.disabled = true; });
           pick(transports.every((k) => k === "ollama") ? "ollama"
              : transports.every((k) => k === "custom") ? "custom" : "openrouter");
         }).catch(() => pick("openrouter"));

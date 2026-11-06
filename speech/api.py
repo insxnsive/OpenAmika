@@ -684,7 +684,7 @@ async def build_f_ollama_use(request: Request):
 
 # ── the custom OpenAI-compatible endpoint (config/custom_models.json on the brain) ──
 _CUSTOM_FIELDS = ("ok", "configured", "base_url", "key_hint", "key_present", "models", "note", "in_use",
-                  "blocked")
+                  "blocked", "verified")
 
 
 @app.get("/api/build_f/custom")

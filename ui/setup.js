@@ -345,7 +345,14 @@
       $("cuConfigured").textContent = "This endpoint is configured with " + (r.models || models.length) + " model(s). Saving replaces them.";
       toast(r.note || "Custom endpoint saved.");
       loadModels();
-    } catch (error) { $("cuStatus").textContent = String(error.message || error); }
+      // The save may have ended blocked, and another tab may have changed it: drop the cached read
+      // and ask again instead of showing the status this panel loaded with.
+      customLoaded = false;
+      loadCustom();
+    } catch (error) {
+      $("cuStatus").textContent = String(error.message || error);
+      customLoaded = false;
+    }
   });
   $("orBack").addEventListener("click", async () => {
     try {
