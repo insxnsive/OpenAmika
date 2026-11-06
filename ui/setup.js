@@ -251,7 +251,14 @@
     row._read = () => {
       row._invalid = "";
       const apiModel = api.querySelector("input").value.trim();
-      if (!apiModel) return null;
+      // A row that came from the catalog and now has no id would otherwise drop out of the save and
+      // take the model with it, silently, while the person watching may have meant to keep it.
+      if (!apiModel) {
+        if (row._loaded && row._loaded.api_model) {
+          row._invalid = "Model id for " + row._loaded.api_model + " is empty. Save it again, or use Remove to drop it.";
+        }
+        return null;
+      }
       const rawIn = priceIn.querySelector("input").value.trim();
       const rawOut = priceOut.querySelector("input").value.trim();
       // Zero is a legitimate price, so a blank field is a mistake, not a zero: the catalog refuses
@@ -264,7 +271,7 @@
       const values = { input: Number(rawIn), output: Number(rawOut) };
       // cache_read and json_object are shown as the catalog holds them; the panel cannot edit them.
       if (loaded.prices && typeof loaded.prices.cache_read === "number") values.cache_read = loaded.prices.cache_read;
-      const jsonMode = check.checked ? "json_schema" : (loaded.json_mode === "json_object" ? "json_object" : null);
+      const jsonMode = check.checked ? "json_schema" : null;
       return { model_id: "custom/" + apiModel, api_model: apiModel,
                context: (context.querySelector("input").value.trim() === "" ? null
                          : Number(context.querySelector("input").value.trim())) || null,
@@ -286,6 +293,17 @@
       else if (row._invalid && !invalid) invalid = row._invalid;
     }
     return { models, invalid };
+  }
+  function cuBusy(on) {
+    // The save replaces what is on screen when it returns, so the fields it will overwrite are closed
+    // until it does. Otherwise a key typed or a row edited during the request is lost without a word.
+    for (const id of ["cuUrl", "cuKey", "cuTest", "cuSave", "cuAddRow"]) {
+      const node = $(id);
+      if (node) node.disabled = on;
+    }
+    for (const row of cuRows()) {
+      for (const node of row.querySelectorAll("input, button")) node.disabled = on;
+    }
   }
   let customLoading = null;
   async function loadCustom() {
@@ -314,7 +332,7 @@
       customLoaded = true;
     } catch (error) {
       $("cuStatus").textContent = "status unavailable: " + (error.message || error);
-    } finally { customLoading = null; }
+    } finally { customLoading = null; cuBusy(false); }
     })();
     return customLoading;
   }
@@ -336,6 +354,7 @@
       return;
     }
     $("cuStatus").textContent = "saving…";
+    cuBusy(true);
     try {
       const r = await postAction("/api/build_f/custom", "custom-provider",
                                  { base_url: $("cuUrl").value.trim(), key: $("cuKey").value.trim(), models });
@@ -352,6 +371,7 @@
     } catch (error) {
       $("cuStatus").textContent = String(error.message || error);
       customLoaded = false;
+      cuBusy(false);
     }
   });
   $("orBack").addEventListener("click", async () => {

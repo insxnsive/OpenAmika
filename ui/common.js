@@ -194,7 +194,6 @@
         if (c.blocked) add("err", "Custom endpoint", "unusable until a save succeeds: " + c.blocked);
         else if (!c.configured) add("err", "Custom endpoint", "no endpoint saved — Setup → Brain → Custom endpoint");
         else if (!c.key_present) add("err", "Custom endpoint", c.base_url + " has no key saved — Setup → Brain → Custom endpoint");
-        else if (!c.preset_ready) add("warn", "Custom endpoint", c.base_url + " — tick JSON schema on one model in Setup, or the memory writer has nowhere to go");
         else add("ok", "Custom endpoint", c.base_url);
       } catch (_) { add("err", "Custom endpoint", "status unavailable"); }
     }
