@@ -185,6 +185,28 @@ class CustomRouteTests(unittest.TestCase):
         self.assertIn('Enter the key', response.get_json()['error'])
         fetch.assert_not_called()
 
+    def test_a_refused_key_keeps_its_meaning_for_the_person(self):
+        # The endpoint answered 401. That is a confirmed answer, so the page must show it as one
+        # instead of the generic "unconfirmed" wording a transport failure gets.
+        response = self.post_probe(status=401)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("refused that key", response.get_json()['error'])
+
+    def test_an_endpoint_that_is_not_serving_models_says_so(self):
+        response = self.post_probe(status=404)
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("not serving that URL", response.get_json()['error'])
+
+    def post_probe(self, *, status):
+        response = mock.MagicMock(status_code=status)
+        response.json.return_value = {"error": "nope"}
+        http = mock.MagicMock()
+        http.get.return_value = response
+        self.g['http_requests'] = http
+        return self.client.post('/api/build_f/custom/test',
+                                json={'base_url': BODY['base_url'], 'key': 'sk-probe'},
+                                headers={'X-Build-F-Action': 'custom-provider-test'})
+
     def test_a_duplicate_env_definition_cannot_win_after_a_restart(self):
         # A stray second definition, including the export form, is what a later boot would read.
         (self.root / 'brain/.env').write_text(

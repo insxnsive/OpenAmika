@@ -32,7 +32,7 @@ import threading
 from f_extract import SYSTEM, FACT_INSTRUCTION, parse_isolated_facts
 from f_memory import _write
 from f_openrouter import (ALIBABA, CUSTOM, AlibabaClient, CustomClient, OpenRouterClient, alibaba_base_url,
-                          alibaba_role_config, custom_base_url, custom_role_config, embedding_config,
+                          alibaba_role_config, custom_role_config, embedding_config,
                           load_alibaba_catalog, load_catalog, load_custom_catalog, role_config)
 from f_ollama import OLLAMA, THINKING_ROLES, OllamaClient, load_ollama_config, ollama_role_config
 
@@ -198,6 +198,14 @@ class RoleManager:
             if transport not in PROVIDERS:
                 raise ValueError("Unknown model provider")
             item["transport"] = transport
+            if transport == CUSTOM and not disabled:
+                # A recovery note means a save stopped halfway: the catalog on disk may not match the
+                # rows in this document. Resolving them here would raise before the repair pages exist,
+                # and the whole brain would refuse to start over one provider. Keep them listed and off
+                # until a save republishes them; the roles fall back to their other options.
+                blocked = self.g.get("_custom_unavailable")
+                if blocked:
+                    disabled, reason = True, reason or ("The endpoint is blocked until a save succeeds: " + blocked)
             if not disabled:
                 # A disabled row is listed only; its endpoint is never configured or called.
                 config = self._config(role, transport, row)

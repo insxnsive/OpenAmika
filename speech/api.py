@@ -760,7 +760,9 @@ async def _build_f_control(request, route, action, allowed_fields, max_body=8192
             async with client.post((base or HANE_URL).rstrip("/") + route, json=payload,
                                    headers={"X-Build-F-Action": action}, allow_redirects=False) as response:
                 result = await response.json()
-                if response.status in (400, 403, 409, 503):
+                # 502 is a confirmed answer from the endpoint (it replied with an error), so it carries
+                # real guidance. Only a transport failure is unconfirmed.
+                if response.status in (400, 401, 403, 409, 502, 503):
                     message = (result.get("error", "Action was refused.") if isinstance(result, dict)
                                else "Action was refused.")
                     code = result.get("code") if isinstance(result, dict) else None

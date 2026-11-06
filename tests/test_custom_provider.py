@@ -217,6 +217,17 @@ class UsageTests(unittest.TestCase):
         self.assertAlmostEqual(normalized['cost_usd'], (1000 * 1.0 + 200 * 0.25 + 500 * 2.0) / 1e6)
         self.assertEqual(normalized['tokens']['reasoning_tokens'], 100)
 
+    def test_deepseek_cache_hits_are_priced_as_cache(self):
+        # DeepSeek reports prompt_cache_hit_tokens instead of prompt_tokens_details. The ledger already
+        # reads it, so pricing that ignored it charged the whole prompt at the input rate.
+        price = {'input': 1.0, 'output': 2.0, 'cache_read': 0.1}
+        normalized = normalize_custom_usage({'prompt_tokens': 1000, 'completion_tokens': 0,
+                                             'prompt_cache_hit_tokens': 800}, price)
+        self.assertTrue(normalized['complete'])
+        self.assertEqual(normalized['tokens']['cache_read_tokens'], 800)
+        self.assertEqual(normalized['tokens']['input_uncached_tokens'], 200)
+        self.assertAlmostEqual(normalized['cost_usd'], (200 * 1.0 + 800 * 0.1) / 1e6)
+
     def test_missing_counts_leave_the_cost_unknown(self):
         normalized = normalize_custom_usage({'prompt_tokens': 10}, self.price)
         self.assertFalse(normalized['complete'])

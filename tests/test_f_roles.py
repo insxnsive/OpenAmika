@@ -545,6 +545,40 @@ class CustomReloadTests(unittest.TestCase):
                       self.local, {})
         self.assertEqual(fresh.get('_custom_unavailable'), 'split files')
 
+    def test_a_recovery_note_does_not_stop_the_brain_with_custom_rows(self):
+        """A save that stops halfway leaves rows naming a model the catalog no longer carries.
+
+        Resolving those rows at startup raised before the repair pages were installed, so one provider
+        could stop the whole app from starting. They are listed as off instead, and the roles fall back.
+        """
+        from f_roles import install_roles
+        root = Path(self.tmp.name) / 'third'
+        (root / 'config').mkdir(parents=True)
+        shutil.copyfile(ROOT / 'config/openrouter_models.json', root / 'config/openrouter_models.json')
+        # The catalog carries only custom/keep; the document still names custom/gone from the interrupted save.
+        (root / 'config/custom_models.json').write_text(json.dumps({
+            'version': 1, 'provider': 'custom', 'endpoint': {'base_url': 'https://api.example.test/v1'},
+            'models': [{'model_id': 'custom/keep', 'api_model': 'keep', 'prices': {'input': 1.0, 'output': 2.0},
+                        'json_mode': 'json_schema'}]}), encoding='utf-8')
+        document = {'version': 1, 'options': {}, 'selections': {}}
+        for role in ROLES:
+            document['options'][role] = [
+                {'key': 'or:' + role, 'model_id': 'deepseek/deepseek-v4-flash-0731', 'name': 'Reviewed ' + role},
+                {'key': role + ':custom/gone', 'provider': 'custom', 'model_id': 'custom/gone', 'name': 'Gone'}]
+            document['selections'][role] = role + ':custom/gone'
+        (root / 'config/llm_roles.json').write_text(json.dumps(document), encoding='utf-8')
+        (root / 'config/custom_models.recovery.json').write_text('{"reason": "split files"}', encoding='utf-8')
+        fresh = {'AVAILABLE_MODELS': {}, '_pick_stream': lambda p, c, **kw: iter(['native']), 'http_requests': None}
+        install_roles(fresh, root, self.memory, self.meter, lambda *a, **k: contextlib.nullcontext(),
+                      self.local, {})
+        manager = fresh['F_ROLES']
+        self.assertEqual(fresh.get('_custom_unavailable'), 'split files')
+        row = manager.options['surface']['surface:custom/gone']
+        self.assertTrue(row['disabled'])
+        self.assertIn('blocked until a save succeeds', row['disabled_reason'])
+        self.assertEqual(manager.selections['surface'], 'or:surface')
+        self.assertEqual(manager.transport_of(), 'openrouter')
+
     def test_a_catalog_write_failure_keeps_the_recovery_note(self):
         marker = self.root / 'config/recovery.json'
         marker.write_text('{"reason": "split files from an earlier save"}', encoding='utf-8')

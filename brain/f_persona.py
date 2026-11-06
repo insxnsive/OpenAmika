@@ -194,6 +194,10 @@ def _commit_custom_config(catalog, payload, key, manager, g, catalog_path, roles
             # paired with the previous catalog.
             os.environ["CUSTOM_OPENAI_API_KEY"] = key
         if manager is not None:
+            # The repair is on disk now, so the reload has to see a live provider: leaving the block in
+            # place would rebuild the rows as off and the person would have to restart anyway. A failed
+            # reload puts the block back through the caller's restore path.
+            g.pop("_custom_unavailable", None)
             manager.reload_custom()
 
     def _restore():
@@ -776,7 +780,8 @@ def install_persona(g):
     @app.route("/api/build_f/custom/test", methods=["POST"])
     def custom_provider_test():
         try:
-            from f_openrouter import custom_base_url, fetch_custom_models
+            from f_openrouter import (OpenRouterAuthError, OpenRouterError, OpenRouterHTTPError,
+                                      custom_base_url, fetch_custom_models)
             value = action_request("custom-provider-test")
             base = custom_base_url(value.get("base_url"))
             key = _validate_custom_key(value.get("key"))
@@ -791,6 +796,16 @@ def install_persona(g):
             except ValueError:
                 # requests.InvalidHeader is a ValueError whose message carries the header value.
                 return jsonify({"ok": False, "error": "The endpoint did not accept that key."}), 400
+            except OpenRouterAuthError:
+                # A key the endpoint refused is a confirmed answer, not an unknown: say so, and say
+                # nothing that could carry the header back.
+                return jsonify({"ok": False, "error": "The endpoint refused that key. Check it and try again."}), 400
+            except OpenRouterHTTPError as error:
+                return jsonify({"ok": False, "error": "The endpoint answered HTTP " + str(error.status)
+                                + " when asked for its model list, so it is not serving that URL."}), 502
+            except OpenRouterError:
+                return jsonify({"ok": False, "error": "The endpoint answered, but not with an OpenAI-style "
+                                "model list. Check the base URL ends at /v1."}), 502
             return jsonify({"ok": True, "base_url": base, "models": models})
         except PermissionError as error:
             return jsonify({"ok": False, "error": str(error)}), 403

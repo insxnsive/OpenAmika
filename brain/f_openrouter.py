@@ -1436,8 +1436,10 @@ def load_custom_catalog(path):
             raise ValueError("Custom catalog needs unique model IDs")
         # Validate the mode here, not only where a role config is built: a catalog this loader
         # accepts is written to disk, and the manager refuses it at the next boot.
-        if row.get("json_mode") not in (None, "json_object", "json_schema"):
-            raise ValueError("A custom row json_mode must be json_object, json_schema or absent: " + api)
+        if row.get("json_mode") not in (None, "json_schema"):
+            # A custom model is either asked for JSON schema or not asked at all; json_object has no
+            # path through this client, so accepting it in a saved row would promise what cannot run.
+            raise ValueError("A custom row json_mode must be json_schema or absent: " + api)
         models[row["model_id"]] = {"model_id": row["model_id"], "api_model": api, "context": context,
                                   "prices": prices, "json_mode": row.get("json_mode")}
     if not models:
@@ -1484,10 +1486,16 @@ def normalize_custom_usage(raw, price):
     completion = count("completion_tokens", True)
     details = raw.get("prompt_tokens_details")
     details = details if isinstance(details, dict) else {}
+    # Two conventions reach this function, and the ledger already reads both: OpenAI-style
+    # prompt_tokens_details.cached_tokens, and DeepSeek's prompt_cache_hit_tokens. Reading only the
+    # first charged every one of those tokens at the input rate while the ledger recorded them as cache.
     cached = details.get("cached_tokens")
+    if cached is None:
+        cached = raw.get("prompt_cache_hit_tokens")
     cached = cached if isinstance(cached, int) and not isinstance(cached, bool) and cached >= 0 else 0
     if cached > prompt:
         issues.append("cache_tokens_exceed_prompt")
+        cached = prompt
     details_out = raw.get("completion_tokens_details")
     details_out = details_out if isinstance(details_out, dict) else {}
     reasoning = details_out.get("reasoning_tokens")
@@ -1556,10 +1564,6 @@ def make_custom_body(config, messages, *, stream=True, json_schema=None):
     if mode == "json_schema":
         body["response_format"] = {"type": "json_schema", "json_schema": {
             "name": "amika_memory_facts", "strict": True, "schema": copy.deepcopy(json_schema or FACT_SCHEMA)}}
-    elif mode == "json_object":
-        if not any("json" in message["content"].lower() for message in messages):
-            raise ValueError("JSON object mode requires the word JSON in the prompt")
-        body["response_format"] = {"type": "json_object"}
     _body_size(body, config)
     return body
 
