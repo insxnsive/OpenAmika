@@ -129,25 +129,26 @@ KEY_NAME = "CUSTOM_OPENAI_API_KEY"
 def _env_without_key(text, name):
     """Drop every binding of the key, keeping unrelated content exactly as it was.
 
-    Line filtering is not enough: a value may be quoted across several lines, so the assignment has to
-    be removed as one parsed node, or its continuation lines stay behind and shift the values around
-    them on the next load.
+    Offsets come from the untouched text, one span per parsed binding and in source order, because
+    searching text that is being shortened can land on an identical line inside an earlier value.
     """
     from dotenv.parser import parse_stream
 
-    kept = text
+    spans = []
     cursor = 0
     for binding in parse_stream(io.StringIO(text)):
         if getattr(binding, "error", False):
             raise ValueError("brain/.env has a line that cannot be parsed, so nothing was changed.")
-        if (binding.key or "").strip() != name:
-            continue
         chunk = binding.original.string
-        index = kept.find(chunk, cursor)
+        index = text.find(chunk, cursor)
         if index == -1:  # pragma: no cover - the parser hands back the source it read
             raise ValueError("brain/.env could not be rewritten safely, so nothing was changed.")
-        kept = kept[:index] + kept[index + len(chunk):]
-        cursor = index
+        cursor = index + len(chunk)
+        if (binding.key or "").strip() == name:
+            spans.append((index, cursor))
+    kept = text
+    for start_at, end_at in reversed(spans):  # back to front, so earlier offsets stay valid
+        kept = kept[:start_at] + kept[end_at:]
     return kept.splitlines()
 
 

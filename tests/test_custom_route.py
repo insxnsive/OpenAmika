@@ -254,6 +254,17 @@ class CustomRouteTests(unittest.TestCase):
         self.assertEqual(parsed['CUSTOM_OPENAI_API_KEY'], 'sk-kept-key')
         self.assertEqual([line for line in text.splitlines() if line.strip() == '"'], [])
 
+    def test_an_identical_line_inside_a_value_does_not_shadow_the_real_assignment(self):
+        # The parsed binding of the later assignment and the decoy line inside the earlier value carry
+        # the same text, so cutting by search position instead of source offsets eats the wrong one.
+        decoy = 'OPENROUTER_API_KEY="a\nCUSTOM_OPENAI_API_KEY=old-example\nb"\n'
+        (self.root / 'brain/.env').write_text(decoy + 'CUSTOM_OPENAI_API_KEY=old-example\n', encoding='utf-8')
+        self.assertEqual(self.save_with_key('sk-fresh-example').status_code, 200)
+        text, parsed = self.read_env()
+        self.assertEqual(parsed['OPENROUTER_API_KEY'], 'a\nCUSTOM_OPENAI_API_KEY=old-example\nb')
+        self.assertEqual(parsed['CUSTOM_OPENAI_API_KEY'], 'sk-fresh-example')
+        self.assertEqual(text.count('CUSTOM_OPENAI_API_KEY='), 2)   # the decoy text plus the new line
+
     def test_the_page_reads_the_blocked_state(self):
         response = self.client.get('/api/build_f/custom')
         self.assertEqual(response.status_code, 200)
