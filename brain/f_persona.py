@@ -739,7 +739,11 @@ def install_persona(g):
                     # reason stays generic and only the exception type is named.
                     warning = (" It did not answer yet (" + type(error).__name__ +
                                "), so check the URL and the key with Test connection.")
-            _commit_custom_config(catalog=catalog, payload=payload, key=key, manager=g.get("F_ROLES"), g=g,
+            # A save that leaves the key field empty still has a live key for this endpoint, and the file
+            # on disk may hold duplicates or an old multiline value from a manual edit: pass the key that
+            # is actually in use so every save leaves one canonical definition behind.
+            effective_key = probe_key
+            _commit_custom_config(catalog=catalog, payload=payload, key=effective_key, manager=g.get("F_ROLES"), g=g,
                                   catalog_path=CUSTOM_CATALOG, roles_path=ROLE_DOCUMENT, env_path=BRAIN_DIR / ".env",
                                   marker_path=RECOVERY_MARKER)
             note = "Saved. New models are in the role lists now."

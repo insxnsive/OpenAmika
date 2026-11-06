@@ -237,6 +237,23 @@ class CustomRouteTests(unittest.TestCase):
         self.assertEqual(parsed['OPENROUTER_API_KEY'], multiline)
         self.assertEqual(parsed['CUSTOM_OPENAI_API_KEY'], 'sk-test-key')
 
+    def test_a_model_only_save_cleans_up_a_broken_env(self):
+        # An empty key field still means the endpoint has a live key, so the file has to come out
+        # canonical even when nothing new was typed.
+        self.manager_pair('https://api.example.test/v1', 'sk-kept-key')
+        self.g['http_requests'] = mock.MagicMock()
+        (self.root / 'brain/.env').write_text(
+            'CUSTOM_OPENAI_API_KEY=sk-kept-key\nCUSTOM_OPENAI_API_KEY="old\nOPENROUTER_API_KEY=x\n"\n',
+            encoding='utf-8')
+        with mock.patch('f_openrouter.load_custom_catalog', return_value=CATALOG), \
+             mock.patch('f_openrouter.fetch_custom_models', return_value=['custom/first']):
+            response = self.post(body={'base_url': BODY['base_url'], 'key': '', 'models': BODY['models']})
+        self.assertEqual(response.status_code, 200)
+        text, parsed = self.read_env()
+        self.assertEqual(text.count('CUSTOM_OPENAI_API_KEY'), 1)
+        self.assertEqual(parsed['CUSTOM_OPENAI_API_KEY'], 'sk-kept-key')
+        self.assertEqual([line for line in text.splitlines() if line.strip() == '"'], [])
+
     def test_the_page_reads_the_blocked_state(self):
         response = self.client.get('/api/build_f/custom')
         self.assertEqual(response.status_code, 200)
