@@ -13,6 +13,7 @@ returned as warnings, the file still saves, matching the boot-time warn-only sel
 written atomically, and hot-reloaded into the running brain.
 """
 import contextlib
+import io
 import json
 import os
 import re
@@ -122,6 +123,22 @@ def _write_atomic(path: Path, content: str):
     os.replace(tmp, path)
 
 
+KEY_NAME = "CUSTOM_OPENAI_API_KEY"
+
+
+def _env_without_key(text, name):
+    """Drop every semantic definition of the key, keeping unrelated lines untouched."""
+    kept = []
+    for line in text.splitlines():
+        head = line.strip()
+        if head.startswith("export "):
+            head = head[len("export "):].strip()
+        if head.split("=", 1)[0].strip() == name:
+            continue
+        kept.append(line)
+    return kept
+
+
 def _commit_custom_config(catalog, payload, key, manager, g, catalog_path, roles_path, env_path, marker_path,
                           write=None, remove=None):
     """Write the catalog, the role rows and the key as one unit, or put every one of them back.
@@ -146,14 +163,19 @@ def _commit_custom_config(catalog, payload, key, manager, g, catalog_path, roles
         state["wrote"] = True
         write(roles_path, json.dumps(document, ensure_ascii=False, indent=2) + "\n")
         if key:
-            lines = (state["env"] or "").splitlines()
-            for index, line in enumerate(lines):
-                if line.strip().startswith("CUSTOM_OPENAI_API_KEY="):
-                    lines[index] = "CUSTOM_OPENAI_API_KEY=" + key
-                    break
-            else:
-                lines.append("CUSTOM_OPENAI_API_KEY=" + key)
-            write(env_path, "\n".join(lines) + "\n")
+            # Every definition goes, not just the first: a duplicate further down (including an
+            # "export KEY=" form) wins on the next boot while this process uses the new value, so the
+            # endpoint would come back with a credential nobody typed.
+            lines = _env_without_key(state["env"] or "", KEY_NAME)
+            lines.append(KEY_NAME + "=" + key)
+            candidate = "\n".join(lines) + "\n"
+            # Prove what a restart will read before committing it.
+            from dotenv import dotenv_values
+            parsed = dotenv_values(stream=io.StringIO(candidate)).get(KEY_NAME)
+            if parsed != key:
+                raise ValueError("brain/.env would read this key back as a different value ("
+                                 + repr(parsed) + "), so nothing was changed.")
+            write(env_path, candidate)
             state["key_written"] = True
             # Nothing is observable until the guard is released, so publishing here cannot be seen
             # paired with the previous catalog.

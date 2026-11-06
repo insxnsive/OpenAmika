@@ -184,6 +184,23 @@ class CustomRouteTests(unittest.TestCase):
         self.assertIn('Enter the key', response.get_json()['error'])
         fetch.assert_not_called()
 
+    def test_a_duplicate_env_definition_cannot_win_after_a_restart(self):
+        # A stray second definition, including the export form, is what a later boot would read.
+        (self.root / 'brain/.env').write_text(
+            'CUSTOM_OPENAI_API_KEY=sk-old-one\nOPENROUTER_API_KEY=other\n'
+            'export CUSTOM_OPENAI_API_KEY=sk-old-two\n', encoding='utf-8')
+        from dotenv import dotenv_values
+        self.g['http_requests'] = mock.MagicMock()
+        with mock.patch('f_openrouter.load_custom_catalog', return_value=CATALOG), \
+             mock.patch('f_openrouter.fetch_custom_models', return_value=['custom/first']):
+            response = self.post()
+        self.assertEqual(response.status_code, 200)
+        text = (self.root / 'brain/.env').read_text(encoding='utf-8')
+        self.assertEqual(text.count('CUSTOM_OPENAI_API_KEY'), 1)
+        self.assertIn('OPENROUTER_API_KEY=other', text)      # unrelated lines survive
+        self.assertEqual(dotenv_values(stream=__import__('io').StringIO(text))['CUSTOM_OPENAI_API_KEY'],
+                         'sk-test-key')
+
     def test_the_page_reads_the_blocked_state(self):
         response = self.client.get('/api/build_f/custom')
         self.assertEqual(response.status_code, 200)

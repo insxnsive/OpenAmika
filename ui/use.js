@@ -1403,6 +1403,9 @@ registerProcessor('pcm-pusher', PCMPusher);`;
             toast(String(error.message || error), true);
           }
         }, "small primary");
+        // Off from the start: it may only be turned on once the status says the endpoint is ready, and
+        // that answer arrives a request later.
+        cuUse.disabled = true;
         cuPanel.append(el("p", { class: "hint", text: "Her four roles switch to the endpoint saved in Setup → Brain → Custom endpoint, at the prices you entered there." }), cuUse, cuNote);
         const cuHint = el("p", { class: "hint", text: "Using an OpenAI-compatible endpoint? Set it up in Setup → Brain → Custom endpoint, then come back to this step." });
         choice.append(cuBtn);
