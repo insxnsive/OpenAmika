@@ -15,6 +15,7 @@ written atomically, and hot-reloaded into the running brain.
 import contextlib
 import json
 import os
+import re
 import threading
 import uuid
 from datetime import datetime
@@ -596,6 +597,37 @@ def install_persona(g):
             return None
         return load_custom_catalog(CUSTOM_CATALOG)
 
+    def _validate_custom_key(raw):
+        """A key that survives the trip through brain/.env and into a header unchanged."""
+        key = str(raw or "").strip()
+        if not key:
+            return ""
+        if any(character in key for character in ("\x00", "\n", "\r")):
+            raise ValueError("The key contains a character that cannot be saved.")
+        if re.search(r"\$\{?[A-Za-z_][A-Za-z0-9_]*", key):
+            # load_dotenv expands this at the next start, so the endpoint would receive another
+            # provider's secret in place of the text the person pasted.
+            raise ValueError("That looks like a variable reference. Paste the key itself, not a name in braces.")
+        if any(character.isspace() for character in key) or "#" in key:
+            raise ValueError("The key has a space or a # in it. Paste the key itself.")
+        return key
+
+    def _stored_custom_pair():
+        """The endpoint and the key that are live together, or None when there is no usable pair.
+
+        Read through the manager so the two values cannot come from different saves.
+        """
+        manager = g.get("F_ROLES")
+        if manager is None:
+            return None
+        try:
+            pair = manager.custom_runtime()
+        except (RuntimeError, ValueError):
+            return None
+        if not isinstance(pair, dict) or not pair.get("base"):
+            return None
+        return pair
+
     def _custom_key_hint():
         env_path = BRAIN_DIR / ".env"
         if not env_path.is_file():
@@ -643,11 +675,17 @@ def install_persona(g):
                 catalog = load_custom_catalog(probe)
             finally:
                 probe.unlink(missing_ok=True)
-            key = str(value.get("key") or "").strip()
-            if key and any(character in key for character in ("\x00", "\n", "\r")):
-                # os.environ refuses these, and a refusal after the files were written would leave the
-                # endpoint published with the previous key.
-                raise ValueError("The key contains a character that cannot be saved.")
+            # os.environ refuses NUL, CR and LF, and load_dotenv would expand ${NAME}: both have to be
+            # settled before the first write, not after the files are on disk.
+            key = _validate_custom_key(value.get("key"))
+            pair = _stored_custom_pair()
+            same_endpoint = bool(pair) and pair["base"] == catalog["base"]
+            if not key and not same_endpoint:
+                # Setup clears the key field after a save, so a model-only save for a NEW url arrives
+                # with no key. Falling back to the stored one would hand the previous provider's
+                # credential to the host that was just typed in.
+                raise ValueError("Enter the key for this endpoint. A saved key belongs to the endpoint "
+                                 "it was saved with, so a new URL needs its own key.")
             if g.get("_custom_unavailable") and not key:
                 # A repair has to say which key belongs to the endpoint it repairs: the one already
                 # stored may be the key of the endpoint that failed.
@@ -655,13 +693,14 @@ def install_persona(g):
                                  "endpoint cannot reuse the key that is already stored.")
             warning = ""
             verified = False
-            probe_key = key or (os.environ.get("CUSTOM_OPENAI_API_KEY") or "")
+            probe_key = key or (pair["key"] if same_endpoint else "")
             if probe_key:
                 try:
                     verified = bool(fetch_custom_models(g["http_requests"], probe_key, catalog["base"]))
                 except Exception as error:  # noqa: BLE001 - every transport answer is reported, none raised
-                    reason = str(error) if isinstance(error, ValueError) else type(error).__name__
-                    warning = (" It did not answer yet (" + reason +
+                    # A transport exception can quote the whole Authorization header back, so the
+                    # reason stays generic and only the exception type is named.
+                    warning = (" It did not answer yet (" + type(error).__name__ +
                                "), so check the URL and the key with Test connection.")
             _commit_custom_config(catalog=catalog, payload=payload, key=key, manager=g.get("F_ROLES"), g=g,
                                   catalog_path=CUSTOM_CATALOG, roles_path=ROLE_DOCUMENT, env_path=BRAIN_DIR / ".env",
@@ -688,12 +727,18 @@ def install_persona(g):
             from f_openrouter import custom_base_url, fetch_custom_models
             value = action_request("custom-provider-test")
             base = custom_base_url(value.get("base_url"))
-            key = str(value.get("key") or "").strip()
+            key = _validate_custom_key(value.get("key"))
+            pair = _stored_custom_pair()
             if not key:
-                key = (os.environ.get("CUSTOM_OPENAI_API_KEY") or "")
-            if not key:
-                raise ValueError("Enter the key first; the test call needs it.")
-            models = fetch_custom_models(g["http_requests"], key, base)
+                if not pair or pair["base"] != base:
+                    raise ValueError("Enter the key for this endpoint. A saved key only works for the "
+                                     "endpoint it was saved with.")
+                key = pair["key"]
+            try:
+                models = fetch_custom_models(g["http_requests"], key, base)
+            except ValueError:
+                # requests.InvalidHeader is a ValueError whose message carries the header value.
+                return jsonify({"ok": False, "error": "The endpoint did not accept that key."}), 400
             return jsonify({"ok": True, "base_url": base, "models": models})
         except PermissionError as error:
             return jsonify({"ok": False, "error": str(error)}), 403

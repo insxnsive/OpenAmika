@@ -3,6 +3,7 @@
 The commit helper has its own tests in test_f_roles.py. This file is the thin HTTP layer on top of
 it, which is where the action-header refusal, the status mapping and the speech allowlist live.
 """
+import contextlib
 import json
 import os
 import shutil
@@ -94,6 +95,64 @@ class CustomRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn('Enter the key', response.get_json()['error'])
         self.assertFalse((self.root / 'config/custom_models.json').exists())
+
+    def manager_pair(self, base, key):
+        manager = mock.MagicMock()
+        manager.custom_runtime.return_value = {'base': base, 'key': key}
+        manager.custom_write_guard.return_value = contextlib.nullcontext()
+        self.g['F_ROLES'] = manager
+        return manager
+
+    def test_a_new_endpoint_cannot_reuse_the_saved_key(self):
+        self.manager_pair('https://old.test/v1', 'sk-old-provider')
+        body = {'base_url': 'https://new.test/v1', 'key': '', 'models': BODY['models']}
+        with mock.patch('f_openrouter.load_custom_catalog',
+                        return_value={'base': 'https://new.test/v1', 'models': CATALOG['models']}), \
+             mock.patch('f_openrouter.fetch_custom_models') as fetch:
+            response = self.post(body=body)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('Enter the key', response.get_json()['error'])
+        fetch.assert_not_called()                      # the old key never reaches the new host
+        self.assertFalse((self.root / 'config/custom_models.json').exists())
+
+    def test_a_model_only_save_on_the_same_endpoint_still_reuses_the_saved_key(self):
+        self.manager_pair('https://api.example.test/v1', 'sk-saved')
+        self.g['http_requests'] = mock.MagicMock()
+        body = {'base_url': 'https://api.example.test/v1', 'key': '', 'models': BODY['models']}
+        with mock.patch('f_openrouter.load_custom_catalog', return_value=CATALOG), \
+             mock.patch('f_openrouter.fetch_custom_models', return_value=['custom/first']) as fetch:
+            response = self.post(body=body)
+        self.assertEqual(response.status_code, 200)
+        fetch.assert_called_once()
+        self.assertEqual(fetch.call_args[0][1], 'sk-saved')
+
+    def test_a_dotenv_reference_is_refused_as_a_key(self):
+        body = {'base_url': BODY['base_url'], 'key': '${OPENROUTER_API_KEY}', 'models': BODY['models']}
+        with mock.patch('f_openrouter.load_custom_catalog', return_value=CATALOG), \
+             mock.patch('f_openrouter.fetch_custom_models', return_value=['custom/first']):
+            response = self.post(body=body)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('variable reference', response.get_json()['error'])
+        self.assertFalse((self.root / 'config/custom_models.json').exists())
+
+    def test_a_key_with_a_newline_never_reaches_the_test_call(self):
+        body = {'base_url': BODY['base_url'], 'key': 'sk-bad\nsuffix'}
+        with mock.patch('f_openrouter.fetch_custom_models') as fetch:
+            response = self.client.post('/api/build_f/custom/test', json=body,
+                                        headers={'X-Build-F-Action': 'custom-provider-test'})
+        self.assertEqual(response.status_code, 400)
+        fetch.assert_not_called()
+        self.assertNotIn('sk-bad', response.get_json()['error'])
+
+    def test_the_test_route_refuses_a_saved_key_for_another_host(self):
+        self.manager_pair('https://old.test/v1', 'sk-old-provider')
+        body = {'base_url': 'https://new.test/v1', 'key': ''}
+        with mock.patch('f_openrouter.fetch_custom_models') as fetch:
+            response = self.client.post('/api/build_f/custom/test', json=body,
+                                        headers={'X-Build-F-Action': 'custom-provider-test'})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('Enter the key', response.get_json()['error'])
+        fetch.assert_not_called()
 
     def test_the_page_reads_the_blocked_state(self):
         response = self.client.get('/api/build_f/custom')
