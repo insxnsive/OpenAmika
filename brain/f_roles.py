@@ -503,6 +503,14 @@ class RoleManager:
         provider = str((entry or {}).get("provider") or "").lower()
         return self.disabled_providers.get(provider)
 
+    def custom_preset_ready(self):
+        """True when the saved catalog also has a preset that may take all four roles.
+
+        A catalog can be saved with no JSON-schema model, and then the memory writer has nowhere to
+        go, so the preset exists but cannot be applied.
+        """
+        return any(p.get("provider") == CUSTOM and p.get("available") for p in self.presets())
+
     def presets(self):
         result = []
         for preset in self.document.get("presets", []):

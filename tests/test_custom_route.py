@@ -100,6 +100,7 @@ class CustomRouteTests(unittest.TestCase):
         manager = mock.MagicMock()
         manager.custom_runtime.return_value = {'base': base, 'key': key}
         manager.custom_write_guard.return_value = contextlib.nullcontext()
+        manager.custom_preset_ready.return_value = True
         self.g['F_ROLES'] = manager
         return manager
 
@@ -264,6 +265,26 @@ class CustomRouteTests(unittest.TestCase):
         self.assertEqual(parsed['OPENROUTER_API_KEY'], 'a\nCUSTOM_OPENAI_API_KEY=old-example\nb')
         self.assertEqual(parsed['CUSTOM_OPENAI_API_KEY'], 'sk-fresh-example')
         self.assertEqual(text.count('CUSTOM_OPENAI_API_KEY='), 2)   # the decoy text plus the new line
+
+    def test_a_save_without_a_usable_preset_says_so(self):
+        manager = self.manager_pair('https://api.example.test/v1', 'sk-saved')
+        manager.custom_preset_ready.return_value = False
+        self.g['http_requests'] = mock.MagicMock()
+        with mock.patch('f_openrouter.load_custom_catalog', return_value=CATALOG), \
+             mock.patch('f_openrouter.fetch_custom_models', return_value=['custom/first']):
+            response = self.post(body={'base_url': BODY['base_url'], 'key': 'sk-new', 'models': BODY['models']})
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertFalse(payload['preset_ready'])
+        self.assertIn('JSON schema', payload['note'])
+
+    def test_the_status_reports_preset_readiness(self):
+        # With no catalog there is nothing to switch to, and the page needs to hear that rather than a
+        # missing field. The true case is covered by the save route's own preset_ready assertion.
+        self.manager_pair('https://api.example.test/v1', 'sk-saved')
+        payload = self.client.get('/api/build_f/custom').get_json()
+        self.assertIn('preset_ready', payload)
+        self.assertFalse(payload['preset_ready'])
 
     def test_the_page_reads_the_blocked_state(self):
         response = self.client.get('/api/build_f/custom')

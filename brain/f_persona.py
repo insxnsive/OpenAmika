@@ -687,10 +687,13 @@ def install_persona(g):
             for model_id, row in catalog["models"].items():
                 models.append({"model_id": model_id, "api_model": row["api_model"], "context": row.get("context"),
                                "prices": row["prices"], "json_mode": row.get("json_mode")})
+        manager = g.get("F_ROLES")
+        preset_ready = bool(catalog) and bool(manager) and bool(manager.custom_preset_ready())
         return jsonify({"ok": True, "configured": bool(catalog), "blocked": g.get("_custom_unavailable"),
                         "base_url": catalog["base"] if catalog else "", "models": models,
                         "key_hint": _custom_key_hint(),
-                        "key_present": bool(os.environ.get("CUSTOM_OPENAI_API_KEY"))})
+                        "key_present": bool(os.environ.get("CUSTOM_OPENAI_API_KEY")),
+                        "preset_ready": preset_ready})
 
     @app.route("/api/build_f/custom", methods=["POST"])
     def custom_provider_set():
@@ -747,13 +750,20 @@ def install_persona(g):
             _commit_custom_config(catalog=catalog, payload=payload, key=effective_key, manager=g.get("F_ROLES"), g=g,
                                   catalog_path=CUSTOM_CATALOG, roles_path=ROLE_DOCUMENT, env_path=BRAIN_DIR / ".env",
                                   marker_path=RECOVERY_MARKER)
+            manager = g.get("F_ROLES")
+            preset_ready = bool(manager) and bool(manager.custom_preset_ready())
             note = "Saved. New models are in the role lists now."
             if key:
                 note = "Saved. The key takes effect on her next reply."
+            if not preset_ready:
+                # Without one JSON-schema model the memory writer has nowhere to go, so all four roles
+                # cannot switch to this endpoint. Saying so here beats a save that looks finished.
+                note += (" One of these models needs the JSON schema box ticked, or she cannot run all "
+                         "four roles on this endpoint.")
             note += warning
             return jsonify({"ok": True, "configured": True, "base_url": catalog["base"],
                             "models": len(catalog["models"]), "note": note,
-                            "verified": verified})
+                            "verified": verified, "preset_ready": preset_ready})
         except RuntimeError as error:
             return jsonify({"ok": False, "error": str(error)}), 409
         except PermissionError as error:

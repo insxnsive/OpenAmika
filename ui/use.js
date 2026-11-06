@@ -1420,11 +1420,13 @@ registerProcessor('pcm-pusher', PCMPusher);`;
           // A preset applied to an endpoint that is blocked, or saved without a key, fails on the
           // first reply, so the button stays off until Setup can vouch for it.
           getJSON("/api/build_f/custom").then((info) => {
-            const ready = info && info.configured && info.key_present && !info.blocked;
+            const ready = info && info.configured && info.key_present && !info.blocked && info.preset_ready;
             cuUse.disabled = !ready;
             cuUse.title = ready ? ""
               : info && info.blocked ? "This endpoint is blocked until a save succeeds: " + info.blocked
-              : "Set the endpoint and its key up in Setup first.";
+              : info && info.configured && info.key_present && !info.preset_ready
+                ? "One model here needs the JSON schema box ticked in Setup, or she cannot run all four roles on it."
+                : "Set the endpoint and its key up in Setup first.";
             cuNote.textContent = ready ? "" : cuUse.title;
           }).catch(() => { cuUse.disabled = true; });
           pick(transports.every((k) => k === "ollama") ? "ollama"
